@@ -12,8 +12,17 @@ create table if not exists tenant_api_keys (
   prefix text not null,
   label text not null,
   status text not null,
+  secret_hash text not null,
   created_at timestamptz not null default now(),
   last_used_at timestamptz
+);
+
+create table if not exists tenant_management_tokens (
+  id uuid primary key,
+  tenant_id uuid not null references tenants(id),
+  subject text not null,
+  token_hash text not null unique,
+  created_at timestamptz not null default now()
 );
 
 create table if not exists provider_accounts (
@@ -68,6 +77,15 @@ create table if not exists role_bindings (
   created_at timestamptz not null default now()
 );
 
+create table if not exists service_accounts (
+  id uuid primary key,
+  subject text not null,
+  role text not null,
+  token_hash text not null unique,
+  scopes jsonb not null,
+  created_at timestamptz not null default now()
+);
+
 create table if not exists audit_events (
   id uuid primary key,
   actor text not null,
@@ -88,4 +106,15 @@ create table if not exists usage_ledger (
   latency_ms bigint not null,
   usage jsonb not null,
   created_at timestamptz not null default now()
+);
+
+create table if not exists account_runtime (
+  provider_account_id uuid primary key references provider_accounts(id),
+  state text not null,
+  health_score integer not null default 100,
+  cooldown_until timestamptz,
+  circuit_open_until timestamptz,
+  in_flight integer not null default 0,
+  max_in_flight integer not null default 8,
+  last_used_at timestamptz
 );

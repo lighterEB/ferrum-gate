@@ -9,20 +9,20 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::net::SocketAddr;
-use storage::{InMemoryPlatformStore, TenantManagementPrincipal};
+use storage::{AuthError, PlatformStore, TenantManagementPrincipal};
 use tracing::info;
 use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct TenantApiState {
-    pub store: InMemoryPlatformStore,
+    pub store: PlatformStore,
 }
 
 impl TenantApiState {
     #[must_use]
     pub fn demo() -> Self {
         Self {
-            store: InMemoryPlatformStore::demo(),
+            store: PlatformStore::demo(),
         }
     }
 }
@@ -55,12 +55,12 @@ async fn me(State(state): State<TenantApiState>, headers: HeaderMap) -> Response
         Ok(principal) => principal,
         Err(response) => return response,
     };
-    let tenant = state
-        .store
-        .list_tenants()
-        .await
-        .into_iter()
-        .find(|tenant| tenant.id == principal.tenant_id);
+    let tenant = match state.store.list_tenants().await {
+        Ok(tenants) => tenants
+            .into_iter()
+            .find(|tenant| tenant.id == principal.tenant_id),
+        Err(error) => return tenant_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
 
     match tenant {
         Some(tenant) => Json(json!(tenant)).into_response(),
@@ -74,10 +74,10 @@ async fn models(State(state): State<TenantApiState>, headers: HeaderMap) -> Resp
         Err(response) => return response,
     };
 
-    Json(json!({
-      "data": state.store.list_tenant_models(principal.tenant_id).await
-    }))
-    .into_response()
+    match state.store.list_tenant_models(principal.tenant_id).await {
+        Ok(models) => Json(json!({ "data": models })).into_response(),
+        Err(error) => tenant_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    }
 }
 
 async fn list_api_keys(State(state): State<TenantApiState>, headers: HeaderMap) -> Response {
@@ -85,10 +85,10 @@ async fn list_api_keys(State(state): State<TenantApiState>, headers: HeaderMap) 
         Ok(principal) => principal,
         Err(response) => return response,
     };
-    Json(json!({
-      "data": state.store.list_tenant_api_keys(principal.tenant_id).await
-    }))
-    .into_response()
+    match state.store.list_tenant_api_keys(principal.tenant_id).await {
+        Ok(keys) => Json(json!({ "data": keys })).into_response(),
+        Err(error) => tenant_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    }
 }
 
 async fn create_api_key(
@@ -107,7 +107,7 @@ async fn create_api_key(
         .await
     {
         Ok(created) => Json(json!(created)).into_response(),
-        Err(_) => tenant_error(StatusCode::BAD_REQUEST, "Failed to create API key"),
+        Err(error) => auth_error_response(error),
     }
 }
 
@@ -127,7 +127,7 @@ async fn rotate_api_key(
         .await
     {
         Ok(created) => Json(json!(created)).into_response(),
-        Err(_) => tenant_error(StatusCode::BAD_REQUEST, "Failed to rotate API key"),
+        Err(error) => auth_error_response(error),
     }
 }
 
@@ -147,7 +147,7 @@ async fn revoke_api_key(
         .await
     {
         Ok(record) => Json(json!(record)).into_response(),
-        Err(_) => tenant_error(StatusCode::BAD_REQUEST, "Failed to revoke API key"),
+        Err(error) => auth_error_response(error),
     }
 }
 
@@ -157,7 +157,10 @@ async fn usage(State(state): State<TenantApiState>, headers: HeaderMap) -> Respo
         Err(response) => return response,
     };
 
-    Json(json!(state.store.usage_summary(principal.tenant_id).await)).into_response()
+    match state.store.usage_summary(principal.tenant_id).await {
+        Ok(summary) => Json(json!(summary)).into_response(),
+        Err(error) => tenant_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    }
 }
 
 async fn requests(State(state): State<TenantApiState>, headers: HeaderMap) -> Response {
@@ -166,10 +169,10 @@ async fn requests(State(state): State<TenantApiState>, headers: HeaderMap) -> Re
         Err(response) => return response,
     };
 
-    Json(json!({
-      "data": state.store.tenant_requests(principal.tenant_id).await
-    }))
-    .into_response()
+    match state.store.tenant_requests(principal.tenant_id).await {
+        Ok(requests) => Json(json!({ "data": requests })).into_response(),
+        Err(error) => tenant_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    }
 }
 
 async fn limits() -> Json<Value> {
@@ -194,6 +197,7 @@ async fn authenticate(
         .store
         .authenticate_tenant_management_token(&token)
         .await
+        .map_err(|error| tenant_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()))?
         .ok_or_else(|| tenant_error(StatusCode::UNAUTHORIZED, "Invalid tenant management token"))
 }
 
@@ -206,6 +210,14 @@ fn tenant_error(status: StatusCode, message: &str) -> Response {
     Json(json!({ "error": { "message": message } }))
         .into_response()
         .with_status(status)
+}
+
+fn auth_error_response(error: AuthError) -> Response {
+    match error {
+        AuthError::Unauthorized => tenant_error(StatusCode::NOT_FOUND, "Resource not found"),
+        AuthError::Forbidden => tenant_error(StatusCode::FORBIDDEN, "Forbidden"),
+        AuthError::Storage(message) => tenant_error(StatusCode::INTERNAL_SERVER_ERROR, &message),
+    }
 }
 
 trait ResponseExt {

@@ -7,13 +7,22 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+aes-gcm.workspace = true
+async-trait.workspace = true
 chrono.workspace = true
+hex.workspace = true
 provider-core = { path = "../provider-core" }
 protocol-core = { path = "../protocol-core" }
 rand.workspace = true
 scheduler = { path = "../scheduler" }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+pg-embed = { version = "1.0.0", default-features = false, features = ["rt_tokio_migrate"] }
+tempfile.workspace = true

@@ -11,7 +11,7 @@ This first milestone is a runnable skeleton that fixes the module boundaries ear
 - multiple provider adapters with compile-time registration
 - provider account pool scheduling and cooldown state
 - future Anthropic-compatible frontend without rewriting the scheduler
-- Postgres-backed configuration and Redis-backed runtime coordination
+- Postgres-first persistence with a demo in-memory fallback
 
 ## Workspace Layout
 
@@ -26,7 +26,7 @@ crates/
   provider-openai-codex/
                      First provider implementation
   scheduler/         Account state machine and candidate selection
-  storage/           In-memory milestone store + persistence-facing models
+  storage/           Unified store wrapper + memory/postgres backends
   observability/     Tracing bootstrap
 migrations/          Postgres schema bootstrap
 ```
@@ -34,32 +34,39 @@ migrations/          Postgres schema bootstrap
 ## Current Milestone
 
 - Rust workspace, tooling and CI are in place
-- OpenAI-compatible routes are runnable with a stubbed `openai_codex` provider
-- Tenant API key lifecycle is implemented against the in-memory store
+- OpenAI-compatible routes are runnable with a real `openai_codex` HTTP adapter
+- Tenant API key lifecycle works through a unified store abstraction
 - Internal control plane can import provider accounts, create route groups and bindings
 - RBAC roles and scope checks are enforced in the control plane skeleton
-- Postgres and Redis local dependencies are defined in `docker-compose.yml`
+- `DATABASE_URL` switches the apps onto a real Postgres backend
+- Without `DATABASE_URL`, the apps still boot in demo memory mode
 
 ## Demo Credentials
 
-The milestone uses seeded demo data so the skeleton can run immediately:
+The in-memory demo backend is seeded so the skeleton can run immediately:
 
 - Gateway API key: `fgk_demo_gateway_key`
 - Tenant management token: `fg_tenant_admin_demo`
 - Control plane admin token: `fg_cp_admin_demo`
 
 These are development-only seeds. Real provider credentials are never returned by the API and should only be stored encrypted.
+Postgres does not auto-seed demo records unless `FERRUMGATE_SEED_DEMO_DATA=true` is set explicitly.
 
 ## Run
 
 ```bash
 docker compose up -d
+export DATABASE_URL=postgres://ferrum_gate:ferrum_gate@127.0.0.1:5432/ferrum_gate
+export FERRUMGATE_MASTER_KEY=local-dev-master-key
+export FERRUMGATE_SEED_DEMO_DATA=true
 cargo fmt
 cargo test
 cargo run -p gateway-http
 cargo run -p tenant-api
 cargo run -p control-plane
 ```
+
+If `DATABASE_URL` is unset, the apps fall back to the seeded in-memory demo store. If `DATABASE_URL` is set, Postgres stays empty by default unless you opt into demo seed data with `FERRUMGATE_SEED_DEMO_DATA=true`.
 
 Default addresses:
 
@@ -102,11 +109,36 @@ curl http://127.0.0.1:3007/internal/v1/provider-accounts \
   }'
 ```
 
+Upload a provider account through the external upload interface:
+
+```bash
+curl http://127.0.0.1:3007/external/v1/provider-accounts/upload \
+  -H "Authorization: Bearer fg_cp_admin_demo" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "provider":"openai_codex",
+    "credential_kind":"oauth_tokens",
+    "payload_version":"v1",
+    "credentials":{
+      "access_token":"token",
+      "account_id":"acct_external_123"
+    },
+    "metadata":{
+      "email":"external@example.com",
+      "plan_type":"plus"
+    },
+    "labels":["shared"],
+    "tags":{"region":"global"}
+  }'
+```
+
 ## Architecture Notes
 
 - `protocol-core` is protocol-neutral on purpose. Future Anthropic support should add a new frontend that maps into the same canonical request and response model.
 - `provider-core` owns the adapter trait and registry. New providers should only add a new crate and register it at startup.
+- `provider-openai-codex` now resolves encrypted account credentials and performs real upstream HTTP calls, with mock-backed tests covering chat, responses and SSE.
 - `scheduler` owns the account state machine and candidate ranking. It does not know about OpenAI or Anthropic wire formats.
-- `storage` currently uses an in-memory implementation for the milestone, but the schema in `migrations/0001_initial.sql` defines the intended Postgres truth source.
+- `storage` now supports two backends behind one interface: demo memory mode and a Postgres-first backend that auto-applies `migrations/0001_initial.sql` on startup.
+- Redis is intentionally deferred. Runtime coordination still lives in `scheduler` and the database-backed `account_runtime` table for this phase.
 
 See [docs/architecture.md](docs/architecture.md) for the first-pass system design.

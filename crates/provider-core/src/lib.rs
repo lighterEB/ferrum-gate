@@ -4,8 +4,9 @@ use futures::stream::BoxStream;
 use protocol_core::{InferenceRequest, InferenceResponse, InferenceStreamEvent, ModelDescriptor};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, fmt, sync::Arc};
 use thiserror::Error;
+use uuid::Uuid;
 
 pub type ProviderStream = BoxStream<'static, Result<InferenceStreamEvent, ProviderError>>;
 
@@ -44,6 +45,31 @@ pub struct QuotaSnapshot {
     pub checked_at: DateTime<Utc>,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct ProviderConnectionInfo {
+    pub account_id: Uuid,
+    pub provider_kind: String,
+    pub credential_kind: String,
+    pub api_base: String,
+    pub bearer_token: String,
+    pub model_override: Option<String>,
+    pub additional_headers: BTreeMap<String, String>,
+}
+
+impl fmt::Debug for ProviderConnectionInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProviderConnectionInfo")
+            .field("account_id", &self.account_id)
+            .field("provider_kind", &self.provider_kind)
+            .field("credential_kind", &self.credential_kind)
+            .field("api_base", &self.api_base)
+            .field("bearer_token", &"<redacted>")
+            .field("model_override", &self.model_override)
+            .field("additional_headers", &self.additional_headers)
+            .finish()
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderErrorKind {
@@ -74,10 +100,21 @@ impl ProviderError {
 }
 
 #[async_trait]
+pub trait ProviderCredentialResolver: Send + Sync {
+    async fn resolve_connection(
+        &self,
+        account_id: Uuid,
+    ) -> Result<Option<ProviderConnectionInfo>, ProviderError>;
+}
+
+#[async_trait]
 pub trait ProviderAdapter: Send + Sync {
     fn kind(&self) -> &'static str;
 
-    async fn list_models(&self) -> Result<Vec<ModelDescriptor>, ProviderError>;
+    async fn list_models(
+        &self,
+        envelope: &ProviderAccountEnvelope,
+    ) -> Result<Vec<ModelDescriptor>, ProviderError>;
 
     async fn validate_credentials(
         &self,
@@ -86,6 +123,7 @@ pub trait ProviderAdapter: Send + Sync {
 
     async fn probe_capabilities(
         &self,
+        envelope: &ProviderAccountEnvelope,
         account: &ValidatedProviderAccount,
     ) -> Result<AccountCapabilities, ProviderError>;
 
@@ -154,7 +192,10 @@ mod tests {
             "dummy"
         }
 
-        async fn list_models(&self) -> Result<Vec<ModelDescriptor>, ProviderError> {
+        async fn list_models(
+            &self,
+            _envelope: &ProviderAccountEnvelope,
+        ) -> Result<Vec<ModelDescriptor>, ProviderError> {
             Ok(vec![ModelDescriptor {
                 id: "dummy-model".to_string(),
                 route_group: "dummy".to_string(),
@@ -177,10 +218,11 @@ mod tests {
 
         async fn probe_capabilities(
             &self,
+            envelope: &ProviderAccountEnvelope,
             _account: &ValidatedProviderAccount,
         ) -> Result<AccountCapabilities, ProviderError> {
             Ok(AccountCapabilities {
-                models: self.list_models().await?,
+                models: self.list_models(envelope).await?,
                 supports_refresh: false,
                 supports_quota_probe: false,
             })
@@ -241,8 +283,10 @@ mod tests {
                 protocol: FrontendProtocol::OpenAi,
                 public_model: "dummy-model".to_string(),
                 upstream_model: None,
+                previous_response_id: None,
                 stream: false,
                 messages: vec![],
+                tools: vec![],
                 metadata: BTreeMap::new(),
             })
             .await

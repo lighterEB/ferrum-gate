@@ -1,18 +1,22 @@
+mod memory;
+mod postgres;
+
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use protocol_core::{ModelCapability, ModelDescriptor, TokenUsage};
-use provider_core::{AccountCapabilities, ProviderAccountEnvelope, ValidatedProviderAccount};
-use scheduler::{
-    AccountRuntime, AccountState, ProviderAccountCandidate, ProviderOutcome, select_candidate,
+use protocol_core::{ModelDescriptor, TokenUsage};
+use provider_core::{
+    AccountCapabilities, ProviderAccountEnvelope, ProviderConnectionInfo,
+    ProviderCredentialResolver, ProviderError, ProviderErrorKind, ValidatedProviderAccount,
 };
+use scheduler::{AccountState, ProviderAccountCandidate, ProviderOutcome};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
-use std::{
-    collections::{BTreeMap, HashMap},
-    sync::Arc,
-};
+use serde_json::Value;
+use std::collections::BTreeMap;
 use thiserror::Error;
-use tokio::sync::RwLock;
 use uuid::Uuid;
+
+pub use memory::InMemoryPlatformStore;
+pub use postgres::PostgresPlatformStore;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Tenant {
@@ -45,12 +49,6 @@ pub struct TenantApiKeyView {
 pub struct CreatedApiKey {
     pub record: TenantApiKeyView,
     pub secret: String,
-}
-
-#[derive(Clone, Debug)]
-struct TenantApiKeyRecord {
-    view: TenantApiKeyView,
-    secret: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -105,11 +103,21 @@ pub enum Permission {
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
+pub enum StoreError {
+    #[error("storage backend error: {0}")]
+    Backend(String),
+    #[error("record not found")]
+    NotFound,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
 pub enum AuthError {
     #[error("unauthorized")]
     Unauthorized,
     #[error("forbidden")]
     Forbidden,
+    #[error("storage backend error: {0}")]
+    Storage(String),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -184,207 +192,72 @@ pub struct AuditEvent {
 }
 
 #[derive(Clone)]
-pub struct InMemoryPlatformStore {
-    inner: Arc<InnerStore>,
+pub enum PlatformStore {
+    InMemory(InMemoryPlatformStore),
+    Postgres(PostgresPlatformStore),
 }
 
-struct InnerStore {
-    tenants: RwLock<BTreeMap<Uuid, Tenant>>,
-    tenant_api_keys: RwLock<BTreeMap<Uuid, TenantApiKeyRecord>>,
-    tenant_api_key_lookup: RwLock<HashMap<String, Uuid>>,
-    tenant_management_tokens: RwLock<HashMap<String, TenantManagementPrincipal>>,
-    service_accounts: RwLock<HashMap<String, ServiceAccountPrincipal>>,
-    provider_accounts: RwLock<BTreeMap<Uuid, ProviderAccountRecord>>,
-    route_groups: RwLock<BTreeMap<Uuid, RouteGroupRecord>>,
-    route_group_bindings: RwLock<BTreeMap<Uuid, RouteGroupBindingRecord>>,
-    runtimes: RwLock<HashMap<Uuid, AccountRuntime>>,
-    requests: RwLock<Vec<RequestRecord>>,
-    audits: RwLock<Vec<AuditEvent>>,
-}
-
-impl Default for InMemoryPlatformStore {
+impl Default for PlatformStore {
     fn default() -> Self {
         Self::demo()
     }
 }
 
-impl InMemoryPlatformStore {
+impl PlatformStore {
     #[must_use]
     pub fn demo() -> Self {
-        let tenant_id =
-            Uuid::parse_str("00000000-0000-0000-0000-000000000001").expect("valid uuid");
-        let route_group_id =
-            Uuid::parse_str("00000000-0000-0000-0000-000000000101").expect("valid uuid");
-        let provider_account_id =
-            Uuid::parse_str("00000000-0000-0000-0000-000000000201").expect("valid uuid");
-        let api_key_id =
-            Uuid::parse_str("00000000-0000-0000-0000-000000000301").expect("valid uuid");
-        let binding_id =
-            Uuid::parse_str("00000000-0000-0000-0000-000000000401").expect("valid uuid");
-        let now = Utc::now();
+        Self::InMemory(InMemoryPlatformStore::demo())
+    }
 
-        let tenant = Tenant {
-            id: tenant_id,
-            slug: "demo-tenant".to_string(),
-            name: "Demo Tenant".to_string(),
-            suspended: false,
-            created_at: now,
-        };
+    pub async fn from_env_or_demo() -> Result<Self, StoreError> {
+        let backend = std::env::var("FERRUMGATE_STORE_BACKEND").ok();
+        let database_url = std::env::var("DATABASE_URL").ok();
 
-        let api_key_secret = "fgk_demo_gateway_key".to_string();
-        let api_key = TenantApiKeyRecord {
-            view: TenantApiKeyView {
-                id: api_key_id,
-                tenant_id,
-                label: "default".to_string(),
-                prefix: api_key_secret[..8].to_string(),
-                status: TenantApiKeyStatus::Active,
-                created_at: now,
-                last_used_at: None,
-            },
-            secret: api_key_secret.clone(),
-        };
+        let use_postgres = matches!(backend.as_deref(), Some("postgres"))
+            || (backend.is_none() && database_url.is_some());
 
-        let provider_account = ProviderAccountRecord {
-            id: provider_account_id,
-            provider: "openai_codex".to_string(),
-            credential_kind: "oauth_tokens".to_string(),
-            payload_version: "v1".to_string(),
-            state: AccountState::Active,
-            external_account_id: "acct_demo_openai_codex".to_string(),
-            redacted_display: Some("d***@***".to_string()),
-            plan_type: Some("plus".to_string()),
-            metadata: json!({ "email": "demo@example.com" }),
-            labels: vec!["shared".to_string(), "prod".to_string()],
-            tags: BTreeMap::from([("region".to_string(), "global".to_string())]),
-            capabilities: vec![
-                "chat".to_string(),
-                "responses".to_string(),
-                "streaming".to_string(),
-            ],
-            expires_at: None,
-            last_validated_at: Some(now),
-            created_at: now,
-        };
-
-        let route_group = RouteGroupRecord {
-            id: route_group_id,
-            slug: "openai-gpt-4-1-mini".to_string(),
-            public_model: "gpt-4.1-mini".to_string(),
-            provider_kind: "openai_codex".to_string(),
-            upstream_model: "gpt-4.1-mini".to_string(),
-            created_at: now,
-        };
-
-        let binding = RouteGroupBindingRecord {
-            id: binding_id,
-            route_group_id,
-            provider_account_id,
-            weight: 100,
-            max_in_flight: 16,
-            created_at: now,
-        };
-
-        let inner = InnerStore {
-            tenants: RwLock::new(BTreeMap::from([(tenant_id, tenant)])),
-            tenant_api_keys: RwLock::new(BTreeMap::from([(api_key_id, api_key)])),
-            tenant_api_key_lookup: RwLock::new(HashMap::from([(api_key_secret, api_key_id)])),
-            tenant_management_tokens: RwLock::new(HashMap::from([(
-                "fg_tenant_admin_demo".to_string(),
-                TenantManagementPrincipal {
-                    subject: "tenant-admin-demo".to_string(),
-                    tenant_id,
-                },
-            )])),
-            service_accounts: RwLock::new(HashMap::from([
-                (
-                    "fg_cp_admin_demo".to_string(),
-                    ServiceAccountPrincipal {
-                        subject: "platform-admin-demo".to_string(),
-                        role: Role::PlatformAdmin,
-                        scopes: vec![ScopeTarget::Global],
-                    },
-                ),
-                (
-                    "fg_cp_routing_demo".to_string(),
-                    ServiceAccountPrincipal {
-                        subject: "routing-operator-demo".to_string(),
-                        role: Role::RoutingOperator,
-                        scopes: vec![ScopeTarget::Global],
-                    },
-                ),
-            ])),
-            provider_accounts: RwLock::new(BTreeMap::from([(
-                provider_account_id,
-                provider_account,
-            )])),
-            route_groups: RwLock::new(BTreeMap::from([(route_group_id, route_group)])),
-            route_group_bindings: RwLock::new(BTreeMap::from([(binding_id, binding)])),
-            runtimes: RwLock::new(HashMap::from([(
-                provider_account_id,
-                AccountRuntime::new(AccountState::Active, 16),
-            )])),
-            requests: RwLock::new(Vec::new()),
-            audits: RwLock::new(Vec::new()),
-        };
-
-        Self {
-            inner: Arc::new(inner),
+        if use_postgres {
+            return Ok(Self::Postgres(
+                PostgresPlatformStore::connect_from_env().await?,
+            ));
         }
+
+        Ok(Self::demo())
     }
 
     #[must_use]
     pub fn demo_gateway_key() -> &'static str {
-        "fgk_demo_gateway_key"
+        InMemoryPlatformStore::demo_gateway_key()
     }
 
     #[must_use]
     pub fn demo_tenant_management_token() -> &'static str {
-        "fg_tenant_admin_demo"
+        InMemoryPlatformStore::demo_tenant_management_token()
     }
 
     #[must_use]
     pub fn demo_control_plane_token() -> &'static str {
-        "fg_cp_admin_demo"
+        InMemoryPlatformStore::demo_control_plane_token()
     }
 
-    pub async fn validate_gateway_api_key(&self, secret: &str) -> Option<GatewayAuthContext> {
-        let api_key_id = self
-            .inner
-            .tenant_api_key_lookup
-            .read()
-            .await
-            .get(secret)
-            .copied()?;
-        let mut api_keys = self.inner.tenant_api_keys.write().await;
-        let record = api_keys.get_mut(&api_key_id)?;
-        if record.view.status != TenantApiKeyStatus::Active {
-            return None;
+    pub async fn validate_gateway_api_key(
+        &self,
+        secret: &str,
+    ) -> Result<Option<GatewayAuthContext>, StoreError> {
+        match self {
+            Self::InMemory(store) => store.validate_gateway_api_key(secret).await,
+            Self::Postgres(store) => store.validate_gateway_api_key(secret).await,
         }
-        record.view.last_used_at = Some(Utc::now());
-        let tenant = self
-            .inner
-            .tenants
-            .read()
-            .await
-            .get(&record.view.tenant_id)
-            .cloned()?;
-        if tenant.suspended {
-            return None;
-        }
-        Some(GatewayAuthContext { tenant, api_key_id })
     }
 
     pub async fn authenticate_tenant_management_token(
         &self,
         token: &str,
-    ) -> Option<TenantManagementPrincipal> {
-        self.inner
-            .tenant_management_tokens
-            .read()
-            .await
-            .get(token)
-            .cloned()
+    ) -> Result<Option<TenantManagementPrincipal>, StoreError> {
+        match self {
+            Self::InMemory(store) => store.authenticate_tenant_management_token(token).await,
+            Self::Postgres(store) => store.authenticate_tenant_management_token(token).await,
+        }
     }
 
     pub async fn authorize_control(
@@ -393,51 +266,34 @@ impl InMemoryPlatformStore {
         permission: Permission,
         target: ScopeTarget,
     ) -> Result<ServiceAccountPrincipal, AuthError> {
-        let principal = self
-            .inner
-            .service_accounts
-            .read()
-            .await
-            .get(token)
-            .cloned()
-            .ok_or(AuthError::Unauthorized)?;
-
-        if !role_allows(&principal.role, &permission) || !scope_allows(&principal.scopes, &target) {
-            return Err(AuthError::Forbidden);
+        match self {
+            Self::InMemory(store) => store.authorize_control(token, permission, target).await,
+            Self::Postgres(store) => store.authorize_control(token, permission, target).await,
         }
-
-        Ok(principal)
     }
 
-    pub async fn list_tenants(&self) -> Vec<Tenant> {
-        self.inner.tenants.read().await.values().cloned().collect()
+    pub async fn list_tenants(&self) -> Result<Vec<Tenant>, StoreError> {
+        match self {
+            Self::InMemory(store) => store.list_tenants().await,
+            Self::Postgres(store) => store.list_tenants().await,
+        }
     }
 
-    pub async fn create_tenant(&self, slug: String, name: String) -> Tenant {
-        let tenant = Tenant {
-            id: Uuid::new_v4(),
-            slug,
-            name,
-            suspended: false,
-            created_at: Utc::now(),
-        };
-        self.inner
-            .tenants
-            .write()
-            .await
-            .insert(tenant.id, tenant.clone());
-        tenant
+    pub async fn create_tenant(&self, slug: String, name: String) -> Result<Tenant, StoreError> {
+        match self {
+            Self::InMemory(store) => store.create_tenant(slug, name).await,
+            Self::Postgres(store) => store.create_tenant(slug, name).await,
+        }
     }
 
-    pub async fn list_tenant_api_keys(&self, tenant_id: Uuid) -> Vec<TenantApiKeyView> {
-        self.inner
-            .tenant_api_keys
-            .read()
-            .await
-            .values()
-            .filter(|record| record.view.tenant_id == tenant_id)
-            .map(|record| record.view.clone())
-            .collect()
+    pub async fn list_tenant_api_keys(
+        &self,
+        tenant_id: Uuid,
+    ) -> Result<Vec<TenantApiKeyView>, StoreError> {
+        match self {
+            Self::InMemory(store) => store.list_tenant_api_keys(tenant_id).await,
+            Self::Postgres(store) => store.list_tenant_api_keys(tenant_id).await,
+        }
     }
 
     pub async fn create_tenant_api_key(
@@ -445,41 +301,10 @@ impl InMemoryPlatformStore {
         tenant_id: Uuid,
         label: String,
     ) -> Result<CreatedApiKey, AuthError> {
-        if !self.inner.tenants.read().await.contains_key(&tenant_id) {
-            return Err(AuthError::Unauthorized);
+        match self {
+            Self::InMemory(store) => store.create_tenant_api_key(tenant_id, label).await,
+            Self::Postgres(store) => store.create_tenant_api_key(tenant_id, label).await,
         }
-
-        let secret = format!("fgk_{}", Uuid::new_v4().simple());
-        let view = TenantApiKeyView {
-            id: Uuid::new_v4(),
-            tenant_id,
-            label,
-            prefix: secret[..12].to_string(),
-            status: TenantApiKeyStatus::Active,
-            created_at: Utc::now(),
-            last_used_at: None,
-        };
-
-        let record = TenantApiKeyRecord {
-            view: view.clone(),
-            secret: secret.clone(),
-        };
-
-        self.inner
-            .tenant_api_key_lookup
-            .write()
-            .await
-            .insert(secret.clone(), view.id);
-        self.inner
-            .tenant_api_keys
-            .write()
-            .await
-            .insert(view.id, record);
-
-        Ok(CreatedApiKey {
-            record: view,
-            secret,
-        })
     }
 
     pub async fn rotate_tenant_api_key(
@@ -487,35 +312,10 @@ impl InMemoryPlatformStore {
         tenant_id: Uuid,
         api_key_id: Uuid,
     ) -> Result<CreatedApiKey, AuthError> {
-        let mut api_keys = self.inner.tenant_api_keys.write().await;
-        let record = api_keys
-            .get_mut(&api_key_id)
-            .ok_or(AuthError::Unauthorized)?;
-        if record.view.tenant_id != tenant_id {
-            return Err(AuthError::Forbidden);
+        match self {
+            Self::InMemory(store) => store.rotate_tenant_api_key(tenant_id, api_key_id).await,
+            Self::Postgres(store) => store.rotate_tenant_api_key(tenant_id, api_key_id).await,
         }
-
-        self.inner
-            .tenant_api_key_lookup
-            .write()
-            .await
-            .remove(&record.secret);
-
-        let secret = format!("fgk_{}", Uuid::new_v4().simple());
-        record.secret = secret.clone();
-        record.view.prefix = secret[..12].to_string();
-        record.view.status = TenantApiKeyStatus::Active;
-        record.view.last_used_at = None;
-        self.inner
-            .tenant_api_key_lookup
-            .write()
-            .await
-            .insert(secret.clone(), api_key_id);
-
-        Ok(CreatedApiKey {
-            record: record.view.clone(),
-            secret,
-        })
     }
 
     pub async fn revoke_tenant_api_key(
@@ -523,81 +323,34 @@ impl InMemoryPlatformStore {
         tenant_id: Uuid,
         api_key_id: Uuid,
     ) -> Result<TenantApiKeyView, AuthError> {
-        let mut api_keys = self.inner.tenant_api_keys.write().await;
-        let record = api_keys
-            .get_mut(&api_key_id)
-            .ok_or(AuthError::Unauthorized)?;
-        if record.view.tenant_id != tenant_id {
-            return Err(AuthError::Forbidden);
+        match self {
+            Self::InMemory(store) => store.revoke_tenant_api_key(tenant_id, api_key_id).await,
+            Self::Postgres(store) => store.revoke_tenant_api_key(tenant_id, api_key_id).await,
         }
-
-        self.inner
-            .tenant_api_key_lookup
-            .write()
-            .await
-            .remove(&record.secret);
-
-        record.view.status = TenantApiKeyStatus::Revoked;
-        Ok(record.view.clone())
     }
 
-    pub async fn list_tenant_models(&self, _tenant_id: Uuid) -> Vec<ModelDescriptor> {
-        self.inner
-            .route_groups
-            .read()
-            .await
-            .values()
-            .map(|route_group| ModelDescriptor {
-                id: route_group.public_model.clone(),
-                route_group: route_group.slug.clone(),
-                provider_kind: route_group.provider_kind.clone(),
-                upstream_model: route_group.upstream_model.clone(),
-                capabilities: vec![
-                    ModelCapability::Chat,
-                    ModelCapability::Responses,
-                    ModelCapability::Streaming,
-                ],
-            })
-            .collect()
-    }
-
-    pub async fn usage_summary(&self, tenant_id: Uuid) -> UsageSummary {
-        let requests = self.inner.requests.read().await;
-        let mut summary = UsageSummary {
-            total_requests: 0,
-            input_tokens: 0,
-            output_tokens: 0,
-            last_request_at: None,
-        };
-
-        for record in requests
-            .iter()
-            .filter(|record| record.tenant_id == tenant_id)
-        {
-            summary.total_requests += 1;
-            summary.input_tokens += u64::from(record.usage.input_tokens);
-            summary.output_tokens += u64::from(record.usage.output_tokens);
-            summary.last_request_at = Some(
-                summary
-                    .last_request_at
-                    .map_or(record.created_at, |previous| {
-                        previous.max(record.created_at)
-                    }),
-            );
+    pub async fn list_tenant_models(
+        &self,
+        tenant_id: Uuid,
+    ) -> Result<Vec<ModelDescriptor>, StoreError> {
+        match self {
+            Self::InMemory(store) => store.list_tenant_models(tenant_id).await,
+            Self::Postgres(store) => store.list_tenant_models(tenant_id).await,
         }
-
-        summary
     }
 
-    pub async fn tenant_requests(&self, tenant_id: Uuid) -> Vec<RequestRecord> {
-        self.inner
-            .requests
-            .read()
-            .await
-            .iter()
-            .filter(|record| record.tenant_id == tenant_id)
-            .cloned()
-            .collect()
+    pub async fn usage_summary(&self, tenant_id: Uuid) -> Result<UsageSummary, StoreError> {
+        match self {
+            Self::InMemory(store) => store.usage_summary(tenant_id).await,
+            Self::Postgres(store) => store.usage_summary(tenant_id).await,
+        }
+    }
+
+    pub async fn tenant_requests(&self, tenant_id: Uuid) -> Result<Vec<RequestRecord>, StoreError> {
+        match self {
+            Self::InMemory(store) => store.tenant_requests(tenant_id).await,
+            Self::Postgres(store) => store.tenant_requests(tenant_id).await,
+        }
     }
 
     pub async fn record_request(
@@ -609,18 +362,35 @@ impl InMemoryPlatformStore {
         status_code: u16,
         latency_ms: u64,
         usage: TokenUsage,
-    ) {
-        self.inner.requests.write().await.push(RequestRecord {
-            id: Uuid::new_v4(),
-            tenant_id,
-            api_key_id,
-            public_model,
-            provider_kind,
-            status_code,
-            latency_ms,
-            usage,
-            created_at: Utc::now(),
-        });
+    ) -> Result<(), StoreError> {
+        match self {
+            Self::InMemory(store) => {
+                store
+                    .record_request(
+                        tenant_id,
+                        api_key_id,
+                        public_model,
+                        provider_kind,
+                        status_code,
+                        latency_ms,
+                        usage,
+                    )
+                    .await
+            }
+            Self::Postgres(store) => {
+                store
+                    .record_request(
+                        tenant_id,
+                        api_key_id,
+                        public_model,
+                        provider_kind,
+                        status_code,
+                        latency_ms,
+                        usage,
+                    )
+                    .await
+            }
+        }
     }
 
     pub async fn record_audit(
@@ -630,30 +400,37 @@ impl InMemoryPlatformStore {
         resource: impl Into<String>,
         request_id: impl Into<String>,
         details: Value,
-    ) {
-        self.inner.audits.write().await.push(AuditEvent {
-            id: Uuid::new_v4(),
-            actor: actor.into(),
-            action: action.into(),
-            resource: resource.into(),
-            request_id: request_id.into(),
-            occurred_at: Utc::now(),
-            details,
-        });
+    ) -> Result<(), StoreError> {
+        let actor = actor.into();
+        let action = action.into();
+        let resource = resource.into();
+        let request_id = request_id.into();
+        match self {
+            Self::InMemory(store) => {
+                store
+                    .record_audit(actor, action, resource, request_id, details)
+                    .await
+            }
+            Self::Postgres(store) => {
+                store
+                    .record_audit(actor, action, resource, request_id, details)
+                    .await
+            }
+        }
     }
 
-    pub async fn list_audit_events(&self) -> Vec<AuditEvent> {
-        self.inner.audits.read().await.clone()
+    pub async fn list_audit_events(&self) -> Result<Vec<AuditEvent>, StoreError> {
+        match self {
+            Self::InMemory(store) => store.list_audit_events().await,
+            Self::Postgres(store) => store.list_audit_events().await,
+        }
     }
 
-    pub async fn list_provider_accounts(&self) -> Vec<ProviderAccountRecord> {
-        self.inner
-            .provider_accounts
-            .read()
-            .await
-            .values()
-            .cloned()
-            .collect()
+    pub async fn list_provider_accounts(&self) -> Result<Vec<ProviderAccountRecord>, StoreError> {
+        match self {
+            Self::InMemory(store) => store.list_provider_accounts().await,
+            Self::Postgres(store) => store.list_provider_accounts().await,
+        }
     }
 
     pub async fn ingest_provider_account(
@@ -661,60 +438,30 @@ impl InMemoryPlatformStore {
         envelope: ProviderAccountEnvelope,
         validated: ValidatedProviderAccount,
         capabilities: AccountCapabilities,
-    ) -> ProviderAccountRecord {
-        let metadata = envelope.metadata.clone();
-        let plan_type = metadata
-            .get("plan_type")
-            .and_then(Value::as_str)
-            .map(ToString::to_string);
-        let record = ProviderAccountRecord {
-            id: Uuid::new_v4(),
-            provider: envelope.provider,
-            credential_kind: envelope.credential_kind,
-            payload_version: envelope.payload_version,
-            state: AccountState::Active,
-            external_account_id: validated.provider_account_id,
-            redacted_display: validated.redacted_display,
-            plan_type,
-            metadata,
-            labels: envelope.labels,
-            tags: envelope.tags,
-            capabilities: capabilities
-                .models
-                .iter()
-                .map(|model| model.id.clone())
-                .collect(),
-            expires_at: validated.expires_at,
-            last_validated_at: Some(Utc::now()),
-            created_at: Utc::now(),
-        };
-
-        self.inner
-            .runtimes
-            .write()
-            .await
-            .insert(record.id, AccountRuntime::new(AccountState::Active, 16));
-        self.inner
-            .provider_accounts
-            .write()
-            .await
-            .insert(record.id, record.clone());
-
-        record
+    ) -> Result<ProviderAccountRecord, StoreError> {
+        match self {
+            Self::InMemory(store) => {
+                store
+                    .ingest_provider_account(envelope, validated, capabilities)
+                    .await
+            }
+            Self::Postgres(store) => {
+                store
+                    .ingest_provider_account(envelope, validated, capabilities)
+                    .await
+            }
+        }
     }
 
     pub async fn set_provider_account_state(
         &self,
         account_id: Uuid,
         state: AccountState,
-    ) -> Option<ProviderAccountRecord> {
-        let mut accounts = self.inner.provider_accounts.write().await;
-        let record = accounts.get_mut(&account_id)?;
-        record.state = state.clone();
-        if let Some(runtime) = self.inner.runtimes.write().await.get_mut(&account_id) {
-            runtime.state = state;
+    ) -> Result<Option<ProviderAccountRecord>, StoreError> {
+        match self {
+            Self::InMemory(store) => store.set_provider_account_state(account_id, state).await,
+            Self::Postgres(store) => store.set_provider_account_state(account_id, state).await,
         }
-        Some(record.clone())
     }
 
     pub async fn create_route_group(
@@ -722,32 +469,26 @@ impl InMemoryPlatformStore {
         public_model: String,
         provider_kind: String,
         upstream_model: String,
-    ) -> RouteGroupRecord {
-        let slug = public_model.replace('.', "-");
-        let record = RouteGroupRecord {
-            id: Uuid::new_v4(),
-            slug,
-            public_model,
-            provider_kind,
-            upstream_model,
-            created_at: Utc::now(),
-        };
-        self.inner
-            .route_groups
-            .write()
-            .await
-            .insert(record.id, record.clone());
-        record
+    ) -> Result<RouteGroupRecord, StoreError> {
+        match self {
+            Self::InMemory(store) => {
+                store
+                    .create_route_group(public_model, provider_kind, upstream_model)
+                    .await
+            }
+            Self::Postgres(store) => {
+                store
+                    .create_route_group(public_model, provider_kind, upstream_model)
+                    .await
+            }
+        }
     }
 
-    pub async fn list_route_groups(&self) -> Vec<RouteGroupRecord> {
-        self.inner
-            .route_groups
-            .read()
-            .await
-            .values()
-            .cloned()
-            .collect()
+    pub async fn list_route_groups(&self) -> Result<Vec<RouteGroupRecord>, StoreError> {
+        match self {
+            Self::InMemory(store) => store.list_route_groups().await,
+            Self::Postgres(store) => store.list_route_groups().await,
+        }
     }
 
     pub async fn bind_provider_account(
@@ -757,105 +498,95 @@ impl InMemoryPlatformStore {
         weight: u32,
         max_in_flight: u32,
     ) -> Result<RouteGroupBindingRecord, AuthError> {
-        if !self
-            .inner
-            .route_groups
-            .read()
-            .await
-            .contains_key(&route_group_id)
-            || !self
-                .inner
-                .provider_accounts
-                .read()
-                .await
-                .contains_key(&provider_account_id)
-        {
-            return Err(AuthError::Unauthorized);
-        }
-
-        let record = RouteGroupBindingRecord {
-            id: Uuid::new_v4(),
-            route_group_id,
-            provider_account_id,
-            weight,
-            max_in_flight,
-            created_at: Utc::now(),
-        };
-        self.inner
-            .runtimes
-            .write()
-            .await
-            .entry(provider_account_id)
-            .and_modify(|runtime| runtime.max_in_flight = max_in_flight)
-            .or_insert_with(|| AccountRuntime::new(AccountState::Active, max_in_flight));
-        self.inner
-            .route_group_bindings
-            .write()
-            .await
-            .insert(record.id, record.clone());
-        Ok(record)
-    }
-
-    pub async fn resolve_route_group(&self, public_model: &str) -> Option<RouteGroupRecord> {
-        self.inner
-            .route_groups
-            .read()
-            .await
-            .values()
-            .find(|route_group| route_group.public_model == public_model)
-            .cloned()
-    }
-
-    pub async fn scheduler_candidates(&self, public_model: &str) -> Vec<ProviderAccountCandidate> {
-        let Some(route_group) = self.resolve_route_group(public_model).await else {
-            return Vec::new();
-        };
-        let bindings = self.inner.route_group_bindings.read().await;
-        let runtimes = self.inner.runtimes.read().await;
-        let accounts = self.inner.provider_accounts.read().await;
-
-        bindings
-            .values()
-            .filter(|binding| binding.route_group_id == route_group.id)
-            .filter_map(|binding| {
-                let runtime = runtimes.get(&binding.provider_account_id)?.clone();
-                let account = accounts.get(&binding.provider_account_id)?;
-                Some(ProviderAccountCandidate {
-                    account_id: binding.provider_account_id,
-                    route_group_id: binding.route_group_id,
-                    provider_kind: account.provider.clone(),
-                    weight: binding.weight,
-                    runtime,
-                })
-            })
-            .collect()
-    }
-
-    pub async fn mark_scheduler_outcome(&self, account_id: Uuid, outcome: ProviderOutcome) {
-        if let Some(runtime) = self.inner.runtimes.write().await.get_mut(&account_id) {
-            runtime.apply_outcome(outcome.clone(), Utc::now());
-            if let Some(account) = self
-                .inner
-                .provider_accounts
-                .write()
-                .await
-                .get_mut(&account_id)
-            {
-                account.state = runtime.state.clone();
+        match self {
+            Self::InMemory(store) => {
+                store
+                    .bind_provider_account(
+                        route_group_id,
+                        provider_account_id,
+                        weight,
+                        max_in_flight,
+                    )
+                    .await
+            }
+            Self::Postgres(store) => {
+                store
+                    .bind_provider_account(
+                        route_group_id,
+                        provider_account_id,
+                        weight,
+                        max_in_flight,
+                    )
+                    .await
             }
         }
     }
 
-    pub async fn choose_candidate(&self, public_model: &str) -> Option<ProviderAccountCandidate> {
-        let candidates = self.scheduler_candidates(public_model).await;
-        let selected = select_candidate(Utc::now(), &candidates)?;
-        candidates
-            .into_iter()
-            .find(|candidate| candidate.account_id == selected.account_id)
+    pub async fn resolve_route_group(
+        &self,
+        public_model: &str,
+    ) -> Result<Option<RouteGroupRecord>, StoreError> {
+        match self {
+            Self::InMemory(store) => store.resolve_route_group(public_model).await,
+            Self::Postgres(store) => store.resolve_route_group(public_model).await,
+        }
+    }
+
+    pub async fn scheduler_candidates(
+        &self,
+        public_model: &str,
+    ) -> Result<Vec<ProviderAccountCandidate>, StoreError> {
+        match self {
+            Self::InMemory(store) => store.scheduler_candidates(public_model).await,
+            Self::Postgres(store) => store.scheduler_candidates(public_model).await,
+        }
+    }
+
+    pub async fn mark_scheduler_outcome(
+        &self,
+        account_id: Uuid,
+        outcome: ProviderOutcome,
+    ) -> Result<(), StoreError> {
+        match self {
+            Self::InMemory(store) => store.mark_scheduler_outcome(account_id, outcome).await,
+            Self::Postgres(store) => store.mark_scheduler_outcome(account_id, outcome).await,
+        }
+    }
+
+    pub async fn choose_candidate(
+        &self,
+        public_model: &str,
+    ) -> Result<Option<ProviderAccountCandidate>, StoreError> {
+        match self {
+            Self::InMemory(store) => store.choose_candidate(public_model).await,
+            Self::Postgres(store) => store.choose_candidate(public_model).await,
+        }
+    }
+
+    pub async fn resolve_provider_connection(
+        &self,
+        account_id: Uuid,
+    ) -> Result<Option<ProviderConnectionInfo>, StoreError> {
+        match self {
+            Self::InMemory(store) => store.resolve_provider_connection(account_id).await,
+            Self::Postgres(store) => store.resolve_provider_connection(account_id).await,
+        }
     }
 }
 
-fn role_allows(role: &Role, permission: &Permission) -> bool {
+#[async_trait]
+impl ProviderCredentialResolver for PlatformStore {
+    async fn resolve_connection(
+        &self,
+        account_id: Uuid,
+    ) -> Result<Option<ProviderConnectionInfo>, ProviderError> {
+        self.resolve_provider_connection(account_id)
+            .await
+            .map_err(store_error_to_provider_error)
+    }
+}
+
+pub(crate) fn role_allows(role: &Role, permission: &Permission) -> bool {
     match role {
         Role::PlatformAdmin => true,
         Role::SecurityAdmin => matches!(
@@ -882,7 +613,7 @@ fn role_allows(role: &Role, permission: &Permission) -> bool {
     }
 }
 
-fn scope_allows(scopes: &[ScopeTarget], target: &ScopeTarget) -> bool {
+pub(crate) fn scope_allows(scopes: &[ScopeTarget], target: &ScopeTarget) -> bool {
     scopes.iter().any(|scope| match (scope, target) {
         (ScopeTarget::Global, _) => true,
         (ScopeTarget::ProviderPool(left), ScopeTarget::ProviderPool(right)) => left == right,
@@ -892,95 +623,77 @@ fn scope_allows(scopes: &[ScopeTarget], target: &ScopeTarget) -> bool {
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use provider_core::{AccountCapabilities, ProviderAccountEnvelope, ValidatedProviderAccount};
+pub(crate) fn store_error_to_provider_error(error: StoreError) -> ProviderError {
+    ProviderError::new(ProviderErrorKind::InvalidRequest, 500, error.to_string())
+}
 
-    #[tokio::test]
-    async fn create_rotate_and_revoke_tenant_key() {
-        let store = InMemoryPlatformStore::demo();
-        let tenant_id = store.list_tenants().await[0].id;
+pub(crate) fn provider_connection_from_parts(
+    account_id: Uuid,
+    provider_kind: &str,
+    credential_kind: &str,
+    metadata: &Value,
+    credentials: &Value,
+) -> Result<ProviderConnectionInfo, StoreError> {
+    let api_base = credentials
+        .get("api_base")
+        .and_then(Value::as_str)
+        .or_else(|| metadata.get("api_base").and_then(Value::as_str))
+        .map(ToString::to_string)
+        .or_else(|| default_api_base(provider_kind))
+        .ok_or_else(|| {
+            StoreError::Backend(format!("provider account {account_id} is missing api_base"))
+        })?;
 
-        let created = store
-            .create_tenant_api_key(tenant_id, "integration".to_string())
-            .await
-            .expect("key should be created");
-        assert!(
-            store
-                .validate_gateway_api_key(&created.secret)
-                .await
-                .is_some()
-        );
+    let bearer_token = credentials
+        .get("access_token")
+        .and_then(Value::as_str)
+        .or_else(|| credentials.get("bearer_token").and_then(Value::as_str))
+        .or_else(|| credentials.get("api_key").and_then(Value::as_str))
+        .map(ToString::to_string)
+        .ok_or_else(|| {
+            StoreError::Backend(format!(
+                "provider account {account_id} is missing a bearer credential"
+            ))
+        })?;
 
-        let rotated = store
-            .rotate_tenant_api_key(tenant_id, created.record.id)
-            .await
-            .expect("key should rotate");
-        assert!(
-            store
-                .validate_gateway_api_key(&created.secret)
-                .await
-                .is_none()
-        );
-        assert!(
-            store
-                .validate_gateway_api_key(&rotated.secret)
-                .await
-                .is_some()
-        );
+    let mut additional_headers = BTreeMap::new();
+    additional_headers.extend(extract_header_map(metadata.get("additional_headers")));
+    additional_headers.extend(extract_header_map(credentials.get("additional_headers")));
 
-        let revoked = store
-            .revoke_tenant_api_key(tenant_id, created.record.id)
-            .await
-            .expect("key should revoke");
-        assert_eq!(revoked.status, TenantApiKeyStatus::Revoked);
-    }
+    let model_override = credentials
+        .get("model_override")
+        .and_then(Value::as_str)
+        .or_else(|| metadata.get("model_override").and_then(Value::as_str))
+        .map(ToString::to_string);
 
-    #[tokio::test]
-    async fn scope_authorization_blocks_missing_permissions() {
-        let store = InMemoryPlatformStore::demo();
-        let result = store
-            .authorize_control(
-                "fg_cp_routing_demo",
-                Permission::ImportProviderAccounts,
-                ScopeTarget::ProviderPool("openai_codex".to_string()),
-            )
-            .await;
+    Ok(ProviderConnectionInfo {
+        account_id,
+        provider_kind: provider_kind.to_string(),
+        credential_kind: credential_kind.to_string(),
+        api_base: api_base.trim_end_matches('/').to_string(),
+        bearer_token,
+        model_override,
+        additional_headers,
+    })
+}
 
-        assert_eq!(
-            result.expect_err("should be forbidden"),
-            AuthError::Forbidden
-        );
-    }
+fn extract_header_map(value: Option<&Value>) -> BTreeMap<String, String> {
+    let Some(Value::Object(object)) = value else {
+        return BTreeMap::new();
+    };
 
-    #[tokio::test]
-    async fn ingest_provider_account_becomes_active() {
-        let store = InMemoryPlatformStore::demo();
-        let record = store
-            .ingest_provider_account(
-                ProviderAccountEnvelope {
-                    provider: "openai_codex".to_string(),
-                    credential_kind: "oauth_tokens".to_string(),
-                    payload_version: "v1".to_string(),
-                    credentials: json!({"access_token":"token"}),
-                    metadata: json!({"plan_type":"plus"}),
-                    labels: vec!["shared".to_string()],
-                    tags: BTreeMap::new(),
-                },
-                ValidatedProviderAccount {
-                    provider_account_id: "acct_new".to_string(),
-                    redacted_display: Some("n***@***".to_string()),
-                    expires_at: None,
-                },
-                AccountCapabilities {
-                    models: vec![],
-                    supports_refresh: true,
-                    supports_quota_probe: true,
-                },
-            )
-            .await;
+    object
+        .iter()
+        .filter_map(|(key, value)| value.as_str().map(|value| (key.clone(), value.to_string())))
+        .collect()
+}
 
-        assert_eq!(record.state, AccountState::Active);
+fn default_api_base(provider_kind: &str) -> Option<String> {
+    match provider_kind {
+        "openai_codex" => Some(
+            std::env::var("FERRUMGATE_OPENAI_API_BASE")
+                .unwrap_or_else(|_| "https://api.openai.com/v1".to_string()),
+        ),
+        _ => None,
     }
 }

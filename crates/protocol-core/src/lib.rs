@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -19,18 +20,49 @@ pub enum MessageRole {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CanonicalMessage {
-    pub role: MessageRole,
-    pub content: String,
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentPart {
+    Text { text: String },
+    ImageUrl { image_url: String },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ToolDefinition {
+    pub name: String,
+    pub description: Option<String>,
+    pub parameters: Value,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CanonicalMessage {
+    pub role: MessageRole,
+    pub content: String,
+    #[serde(default)]
+    pub parts: Vec<ContentPart>,
+    #[serde(default)]
+    pub tool_calls: Vec<ToolCall>,
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct InferenceRequest {
     pub protocol: FrontendProtocol,
     pub public_model: String,
     pub upstream_model: Option<String>,
+    #[serde(default)]
+    pub previous_response_id: Option<String>,
     pub stream: bool,
     pub messages: Vec<CanonicalMessage>,
+    #[serde(default)]
+    pub tools: Vec<ToolDefinition>,
     pub metadata: BTreeMap<String, String>,
 }
 
@@ -75,6 +107,8 @@ pub struct InferenceResponse {
     pub model: String,
     pub output_text: String,
     pub finish_reason: FinishReason,
+    #[serde(default)]
+    pub tool_calls: Vec<ToolCall>,
     pub usage: TokenUsage,
     pub provider_kind: String,
     pub created_at: DateTime<Utc>,
@@ -95,6 +129,7 @@ impl InferenceResponse {
             model: model.into(),
             output_text,
             finish_reason: FinishReason::Stop,
+            tool_calls: Vec::new(),
             usage: TokenUsage {
                 input_tokens: 16,
                 output_tokens,

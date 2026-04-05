@@ -12,35 +12,33 @@ use axum::{
 };
 use futures::StreamExt;
 use protocol_core::{
-    CanonicalMessage, FrontendProtocol, InferenceRequest, InferenceResponse, MessageRole,
-    StreamEventKind,
+    CanonicalMessage, ContentPart, FinishReason, FrontendProtocol, InferenceRequest,
+    InferenceResponse, MessageRole, StreamEventKind, ToolCall, ToolDefinition,
 };
 use provider_core::{ProviderError, ProviderErrorKind, ProviderRegistry};
 use provider_openai_codex::OpenAiCodexProvider;
 use scheduler::ProviderOutcome;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, convert::Infallible, net::SocketAddr};
-use storage::{GatewayAuthContext, InMemoryPlatformStore};
+use std::{collections::BTreeMap, convert::Infallible, net::SocketAddr, sync::Arc};
+use storage::{GatewayAuthContext, PlatformStore};
 use tracing::info;
 use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct GatewayAppState {
-    pub store: InMemoryPlatformStore,
+    pub store: PlatformStore,
     pub registry: ProviderRegistry,
 }
 
 impl GatewayAppState {
     #[must_use]
     pub fn demo() -> Self {
+        let store = PlatformStore::demo();
         let mut registry = ProviderRegistry::new();
-        registry.register(OpenAiCodexProvider::shared());
+        registry.register(OpenAiCodexProvider::shared(Arc::new(store.clone())));
 
-        Self {
-            store: InMemoryPlatformStore::demo(),
-            registry,
-        }
+        Self { store, registry }
     }
 }
 
@@ -70,7 +68,10 @@ async fn list_models(State(state): State<GatewayAppState>, headers: HeaderMap) -
         Err(response) => return response,
     };
 
-    let models = state.store.list_tenant_models(auth.tenant.id).await;
+    let models = match state.store.list_tenant_models(auth.tenant.id).await {
+        Ok(models) => models,
+        Err(error) => return internal_error(&error.to_string()),
+    };
     Json(json!({
       "object": "list",
       "data": models.into_iter().map(|model| {
@@ -96,18 +97,20 @@ async fn chat_completions(
     };
 
     let candidate = match state.store.choose_candidate(&request.model).await {
-        Some(candidate) => candidate,
-        None => {
+        Ok(Some(candidate)) => candidate,
+        Ok(None) => {
             return openai_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "No healthy provider candidate",
             );
         }
+        Err(error) => return internal_error(&error.to_string()),
     };
 
     let route_group = match state.store.resolve_route_group(&request.model).await {
-        Some(route_group) => route_group,
-        None => return openai_error(StatusCode::NOT_FOUND, "Unknown model"),
+        Ok(Some(route_group)) => route_group,
+        Ok(None) => return openai_error(StatusCode::NOT_FOUND, "Unknown model"),
+        Err(error) => return internal_error(&error.to_string()),
     };
 
     let Some(provider) = state.registry.get(&candidate.provider_kind) else {
@@ -118,16 +121,21 @@ async fn chat_completions(
         protocol: FrontendProtocol::OpenAi,
         public_model: request.model.clone(),
         upstream_model: Some(route_group.upstream_model),
+        previous_response_id: None,
         stream: request.stream,
         messages: request
             .messages
             .iter()
-            .map(|message| CanonicalMessage {
-                role: parse_message_role(&message.role),
-                content: message.content.clone(),
-            })
+            .map(openai_message_to_canonical_message)
             .collect(),
-        metadata: BTreeMap::new(),
+        tools: openai_tools_to_canonical_tools(&request.tools),
+        metadata: BTreeMap::from([
+            (
+                "provider_account_id".to_string(),
+                candidate.account_id.to_string(),
+            ),
+            ("route_group_id".to_string(), route_group.id.to_string()),
+        ]),
     };
 
     if request.stream {
@@ -157,18 +165,32 @@ async fn chat_completions(
                           yield Ok::<Event, Infallible>(Event::default().data(payload.to_string()));
                         }
                         StreamEventKind::Done => {
-                          let payload = json!({
-                            "id": format!("chatcmpl_{}", Uuid::new_v4().simple()),
-                            "object": "chat.completion.chunk",
-                            "created": chrono::Utc::now().timestamp(),
-                            "model": public_model,
-                            "choices": [{
-                              "index": 0,
-                              "delta": {},
-                              "finish_reason": "stop"
-                            }]
-                          });
                           if let Some(response) = event.response {
+                            if !response.tool_calls.is_empty() {
+                              let payload = json!({
+                                "id": format!("chatcmpl_{}", Uuid::new_v4().simple()),
+                                "object": "chat.completion.chunk",
+                                "created": chrono::Utc::now().timestamp(),
+                                "model": public_model,
+                                "choices": [{
+                                  "index": 0,
+                                  "delta": { "tool_calls": tool_calls_json(&response.tool_calls) },
+                                  "finish_reason": Value::Null
+                                }]
+                              });
+                              yield Ok(Event::default().data(payload.to_string()));
+                            }
+                            let final_payload = json!({
+                              "id": format!("chatcmpl_{}", Uuid::new_v4().simple()),
+                              "object": "chat.completion.chunk",
+                              "created": chrono::Utc::now().timestamp(),
+                              "model": public_model,
+                              "choices": [{
+                                "index": 0,
+                                "delta": {},
+                                "finish_reason": finish_reason_label(&response.finish_reason)
+                              }]
+                            });
                             store
                               .record_request(
                                 tenant_id,
@@ -179,17 +201,39 @@ async fn chat_completions(
                                 10,
                                 response.usage,
                               )
-                              .await;
+                              .await
+                              .ok();
+                            store
+                              .mark_scheduler_outcome(candidate.account_id, ProviderOutcome::Success)
+                              .await
+                              .ok();
+                            yield Ok(Event::default().data(final_payload.to_string()));
+                          } else {
+                            let payload = json!({
+                              "id": format!("chatcmpl_{}", Uuid::new_v4().simple()),
+                              "object": "chat.completion.chunk",
+                              "created": chrono::Utc::now().timestamp(),
+                              "model": public_model,
+                              "choices": [{
+                                "index": 0,
+                                "delta": {},
+                                "finish_reason": "stop"
+                              }]
+                            });
+                            yield Ok(Event::default().data(payload.to_string()));
                           }
-                          store
-                            .mark_scheduler_outcome(candidate.account_id, ProviderOutcome::Success)
-                            .await;
-                          yield Ok(Event::default().data(payload.to_string()));
                           yield Ok(Event::default().data("[DONE]"));
                         }
                         _ => {}
                       },
                       Err(error) => {
+                        store
+                          .mark_scheduler_outcome(
+                            candidate.account_id,
+                            provider_outcome_for_error(&error),
+                          )
+                          .await
+                          .ok();
                         let payload = json!({
                           "error": {
                             "message": error.message,
@@ -214,7 +258,8 @@ async fn chat_completions(
                         candidate.account_id,
                         provider_outcome_for_error(&error),
                     )
-                    .await;
+                    .await
+                    .ok();
                 return provider_error_response(error);
             }
         }
@@ -225,7 +270,8 @@ async fn chat_completions(
             state
                 .store
                 .mark_scheduler_outcome(candidate.account_id, ProviderOutcome::Success)
-                .await;
+                .await
+                .ok();
             state
                 .store
                 .record_request(
@@ -237,14 +283,16 @@ async fn chat_completions(
                     8,
                     response.usage.clone(),
                 )
-                .await;
+                .await
+                .ok();
             Json(chat_completion_json(response)).into_response()
         }
         Err(error) => {
             state
                 .store
                 .mark_scheduler_outcome(candidate.account_id, provider_outcome_for_error(&error))
-                .await;
+                .await
+                .ok();
             provider_error_response(error)
         }
     }
@@ -261,18 +309,20 @@ async fn responses(
     };
 
     let candidate = match state.store.choose_candidate(&request.model).await {
-        Some(candidate) => candidate,
-        None => {
+        Ok(Some(candidate)) => candidate,
+        Ok(None) => {
             return openai_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "No healthy provider candidate",
             );
         }
+        Err(error) => return internal_error(&error.to_string()),
     };
 
     let route_group = match state.store.resolve_route_group(&request.model).await {
-        Some(route_group) => route_group,
-        None => return openai_error(StatusCode::NOT_FOUND, "Unknown model"),
+        Ok(Some(route_group)) => route_group,
+        Ok(None) => return openai_error(StatusCode::NOT_FOUND, "Unknown model"),
+        Err(error) => return internal_error(&error.to_string()),
     };
     let Some(provider) = state.registry.get(&candidate.provider_kind) else {
         return openai_error(StatusCode::BAD_GATEWAY, "Provider adapter not registered");
@@ -282,9 +332,17 @@ async fn responses(
         protocol: FrontendProtocol::OpenAi,
         public_model: request.model.clone(),
         upstream_model: Some(route_group.upstream_model),
+        previous_response_id: request.previous_response_id.clone(),
         stream: request.stream,
         messages: responses_input_to_messages(request.input),
-        metadata: BTreeMap::new(),
+        tools: openai_tools_to_canonical_tools(&request.tools),
+        metadata: BTreeMap::from([
+            (
+                "provider_account_id".to_string(),
+                candidate.account_id.to_string(),
+            ),
+            ("route_group_id".to_string(), route_group.id.to_string()),
+        ]),
     };
 
     if request.stream {
@@ -310,27 +368,36 @@ async fn responses(
                           }
                           StreamEventKind::Done => {
                             if let Some(response) = event.response {
-                              store
-                                .record_request(
-                                  tenant_id,
-                                  Some(api_key_id),
-                                  public_model.clone(),
-                                  provider_kind.clone(),
-                                  200,
-                                  10,
-                                  response.usage,
-                                )
-                                .await;
-                            }
-                            store
-                              .mark_scheduler_outcome(candidate.account_id, ProviderOutcome::Success)
-                              .await;
+                      store
+                        .record_request(
+                          tenant_id,
+                          Some(api_key_id),
+                          public_model.clone(),
+                          provider_kind.clone(),
+                          200,
+                          10,
+                          response.usage,
+                        )
+                        .await
+                        .ok();
+                    }
+                    store
+                      .mark_scheduler_outcome(candidate.account_id, ProviderOutcome::Success)
+                      .await
+                      .ok();
                             yield Ok(Event::default().event("response.completed").data("{}"));
                           }
                           _ => {}
                         }
                       }
                       Err(error) => {
+                        store
+                          .mark_scheduler_outcome(
+                            candidate.account_id,
+                            provider_outcome_for_error(&error),
+                          )
+                          .await
+                          .ok();
                         yield Ok(Event::default().event("response.failed").data(json!({"message": error.message}).to_string()));
                       }
                     }
@@ -346,7 +413,8 @@ async fn responses(
                         candidate.account_id,
                         provider_outcome_for_error(&error),
                     )
-                    .await;
+                    .await
+                    .ok();
                 return provider_error_response(error);
             }
         }
@@ -357,7 +425,8 @@ async fn responses(
             state
                 .store
                 .mark_scheduler_outcome(candidate.account_id, ProviderOutcome::Success)
-                .await;
+                .await
+                .ok();
             state
                 .store
                 .record_request(
@@ -369,14 +438,16 @@ async fn responses(
                     8,
                     response.usage.clone(),
                 )
-                .await;
+                .await
+                .ok();
             Json(responses_json(response)).into_response()
         }
         Err(error) => {
             state
                 .store
                 .mark_scheduler_outcome(candidate.account_id, provider_outcome_for_error(&error))
-                .await;
+                .await
+                .ok();
             provider_error_response(error)
         }
     }
@@ -397,6 +468,7 @@ async fn authenticate_gateway(
         .store
         .validate_gateway_api_key(&token)
         .await
+        .map_err(|error| internal_error(&error.to_string()))?
         .ok_or_else(|| openai_error(StatusCode::UNAUTHORIZED, "Invalid API key"))
 }
 
@@ -414,27 +486,183 @@ fn parse_message_role(role: &str) -> MessageRole {
     }
 }
 
+fn openai_message_to_canonical_message(message: &OpenAiMessage) -> CanonicalMessage {
+    let parts = openai_content_parts(&message.content);
+    CanonicalMessage {
+        role: parse_message_role(&message.role),
+        content: text_from_parts(&parts),
+        parts,
+        tool_calls: message
+            .tool_calls
+            .iter()
+            .map(|tool_call| ToolCall {
+                id: tool_call.id.clone(),
+                name: tool_call.function.name.clone(),
+                arguments: tool_call.function.arguments.clone(),
+            })
+            .collect(),
+        tool_call_id: message.tool_call_id.clone(),
+    }
+}
+
+fn openai_tools_to_canonical_tools(tools: &[OpenAiToolDefinition]) -> Vec<ToolDefinition> {
+    tools
+        .iter()
+        .filter(|tool| tool.tool_type == "function")
+        .map(|tool| ToolDefinition {
+            name: tool.function.name.clone(),
+            description: tool.function.description.clone(),
+            parameters: tool.function.parameters.clone(),
+        })
+        .collect()
+}
+
+fn openai_content_parts(content: &OpenAiMessageContent) -> Vec<ContentPart> {
+    match content {
+        OpenAiMessageContent::Text(text) if text.is_empty() => Vec::new(),
+        OpenAiMessageContent::Text(text) => vec![ContentPart::Text { text: text.clone() }],
+        OpenAiMessageContent::Parts(parts) => parts
+            .iter()
+            .filter_map(|part| match part.part_type.as_str() {
+                "text" | "input_text" => part
+                    .text
+                    .as_ref()
+                    .map(|text| ContentPart::Text { text: text.clone() }),
+                "image_url" | "input_image" => part
+                    .image_url
+                    .as_ref()
+                    .and_then(extract_image_url)
+                    .map(|image_url| ContentPart::ImageUrl { image_url }),
+                _ => None,
+            })
+            .collect(),
+    }
+}
+
+fn extract_image_url(value: &Value) -> Option<String> {
+    value.as_str().map(ToString::to_string).or_else(|| {
+        value
+            .get("url")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+    })
+}
+
+fn text_from_parts(parts: &[ContentPart]) -> String {
+    parts
+        .iter()
+        .filter_map(|part| match part {
+            ContentPart::Text { text } => Some(text.as_str()),
+            ContentPart::ImageUrl { .. } => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn responses_input_to_messages(input: Value) -> Vec<CanonicalMessage> {
     match input {
         Value::String(text) => vec![CanonicalMessage {
             role: MessageRole::User,
             content: text,
+            parts: vec![],
+            tool_calls: vec![],
+            tool_call_id: None,
         }],
         Value::Array(items) => items
             .into_iter()
-            .map(|item| CanonicalMessage {
-                role: MessageRole::User,
-                content: item
-                    .get("content")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-            })
+            .filter_map(parse_responses_input_item)
             .collect(),
         other => vec![CanonicalMessage {
             role: MessageRole::User,
             content: other.to_string(),
+            parts: vec![],
+            tool_calls: vec![],
+            tool_call_id: None,
         }],
+    }
+}
+
+fn parse_responses_input_item(item: Value) -> Option<CanonicalMessage> {
+    match item.get("type").and_then(Value::as_str) {
+        Some("function_call") => Some(CanonicalMessage {
+            role: MessageRole::Assistant,
+            content: String::new(),
+            parts: vec![],
+            tool_calls: vec![ToolCall {
+                id: item
+                    .get("call_id")
+                    .or_else(|| item.get("id"))
+                    .and_then(Value::as_str)?
+                    .to_string(),
+                name: item.get("name").and_then(Value::as_str)?.to_string(),
+                arguments: item
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            }],
+            tool_call_id: None,
+        }),
+        Some("function_call_output") => Some(CanonicalMessage {
+            role: MessageRole::Tool,
+            content: item
+                .get("output")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            parts: vec![],
+            tool_calls: vec![],
+            tool_call_id: item
+                .get("call_id")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+        }),
+        _ => {
+            let role = item
+                .get("role")
+                .and_then(Value::as_str)
+                .map(parse_message_role)
+                .unwrap_or(MessageRole::User);
+            let content = item.get("content").cloned().unwrap_or(Value::Null);
+            let parts = match &content {
+                Value::String(text) if !text.is_empty() => {
+                    vec![ContentPart::Text { text: text.clone() }]
+                }
+                Value::Array(parts) => parts
+                    .iter()
+                    .filter_map(|part| match part.get("type").and_then(Value::as_str) {
+                        Some("input_text") | Some("text") => part
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .map(|text| ContentPart::Text {
+                                text: text.to_string(),
+                            }),
+                        Some("input_image") | Some("image_url") => part
+                            .get("image_url")
+                            .or_else(|| part.get("url"))
+                            .and_then(extract_image_url)
+                            .map(|image_url| ContentPart::ImageUrl { image_url }),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+
+            Some(CanonicalMessage {
+                role,
+                content: match content {
+                    Value::String(text) => text,
+                    _ => text_from_parts(&parts),
+                },
+                parts,
+                tool_calls: vec![],
+                tool_call_id: item
+                    .get("tool_call_id")
+                    .or_else(|| item.get("call_id"))
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+            })
+        }
     }
 }
 
@@ -448,9 +676,18 @@ fn chat_completion_json(response: InferenceResponse) -> Value {
         "index": 0,
         "message": {
           "role": "assistant",
-          "content": response.output_text,
+          "content": if response.output_text.is_empty() && !response.tool_calls.is_empty() {
+            Value::Null
+          } else {
+            Value::String(response.output_text.clone())
+          },
+          "tool_calls": if response.tool_calls.is_empty() {
+            Value::Null
+          } else {
+            Value::Array(tool_calls_json(&response.tool_calls))
+          }
         },
-        "finish_reason": "stop"
+        "finish_reason": finish_reason_label(&response.finish_reason)
       }],
       "usage": {
         "prompt_tokens": response.usage.input_tokens,
@@ -461,27 +698,67 @@ fn chat_completion_json(response: InferenceResponse) -> Value {
 }
 
 fn responses_json(response: InferenceResponse) -> Value {
+    let mut output = Vec::new();
+    if !response.output_text.is_empty() {
+        output.push(json!({
+          "id": format!("msg_{}", Uuid::new_v4().simple()),
+          "type": "message",
+          "status": "completed",
+          "role": "assistant",
+          "content": [{
+            "type": "output_text",
+            "text": response.output_text
+          }]
+        }));
+    }
+    output.extend(response.tool_calls.iter().map(|tool_call| {
+        json!({
+          "id": format!("fc_{}", Uuid::new_v4().simple()),
+          "type": "function_call",
+          "call_id": tool_call.id,
+          "name": tool_call.name,
+          "arguments": tool_call.arguments
+        })
+    }));
+
     json!({
       "id": response.id,
       "object": "response",
       "created_at": response.created_at.timestamp(),
       "model": response.model,
-      "output": [{
-        "id": format!("msg_{}", Uuid::new_v4().simple()),
-        "type": "message",
-        "status": "completed",
-        "role": "assistant",
-        "content": [{
-          "type": "output_text",
-          "text": response.output_text
-        }]
-      }],
+      "output": output,
       "usage": {
         "input_tokens": response.usage.input_tokens,
         "output_tokens": response.usage.output_tokens,
         "total_tokens": response.usage.total_tokens
       }
     })
+}
+
+fn tool_calls_json(tool_calls: &[ToolCall]) -> Vec<Value> {
+    tool_calls
+        .iter()
+        .map(|tool_call| {
+            json!({
+              "id": tool_call.id,
+              "type": "function",
+              "function": {
+                "name": tool_call.name,
+                "arguments": tool_call.arguments
+              }
+            })
+        })
+        .collect()
+}
+
+fn finish_reason_label(reason: &FinishReason) -> &'static str {
+    match reason {
+        FinishReason::Stop => "stop",
+        FinishReason::Length => "length",
+        FinishReason::ToolCalls => "tool_calls",
+        FinishReason::ContentFilter => "content_filter",
+        FinishReason::Error => "error",
+    }
 }
 
 fn provider_outcome_for_error(error: &ProviderError) -> ProviderOutcome {
@@ -524,6 +801,19 @@ fn openai_error(status: StatusCode, message: &str) -> Response {
     .with_status(status)
 }
 
+fn internal_error(message: &str) -> Response {
+    Json(json!({
+      "error": {
+        "message": message,
+        "type": "server_error",
+        "code": "storage_error",
+        "param": Value::Null
+      }
+    }))
+    .into_response()
+    .with_status(StatusCode::INTERNAL_SERVER_ERROR)
+}
+
 trait ResponseExt {
     fn with_status(self, status: StatusCode) -> Response;
 }
@@ -540,6 +830,8 @@ struct ChatCompletionRequest {
     model: String,
     messages: Vec<OpenAiMessage>,
     #[serde(default)]
+    tools: Vec<OpenAiToolDefinition>,
+    #[serde(default)]
     stream: bool,
 }
 
@@ -548,23 +840,474 @@ struct ResponsesRequest {
     model: String,
     input: Value,
     #[serde(default)]
+    previous_response_id: Option<String>,
+    #[serde(default)]
+    tools: Vec<OpenAiToolDefinition>,
+    #[serde(default)]
     stream: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 struct OpenAiMessage {
     role: String,
-    content: String,
+    #[serde(default)]
+    content: OpenAiMessageContent,
+    #[serde(default)]
+    tool_call_id: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<OpenAiToolCall>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+enum OpenAiMessageContent {
+    Text(String),
+    Parts(Vec<OpenAiContentPart>),
+}
+
+impl Default for OpenAiMessageContent {
+    fn default() -> Self {
+        Self::Text(String::new())
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct OpenAiContentPart {
+    #[serde(rename = "type")]
+    part_type: String,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    image_url: Option<Value>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct OpenAiToolDefinition {
+    #[serde(rename = "type")]
+    tool_type: String,
+    function: OpenAiFunctionDefinition,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct OpenAiFunctionDefinition {
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    parameters: Value,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct OpenAiToolCall {
+    id: String,
+    #[serde(rename = "type")]
+    tool_type: String,
+    function: OpenAiFunctionCall,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct OpenAiFunctionCall {
+    name: String,
+    arguments: String,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::{
+        Router,
         body::{Body, to_bytes},
+        extract::Request as AxumRequest,
         http::Request,
+        response::IntoResponse,
+        routing::{get, post},
     };
+    use protocol_core::{ModelCapability, ModelDescriptor};
+    use provider_core::{AccountCapabilities, ProviderAccountEnvelope, ValidatedProviderAccount};
+    use serde_json::json;
+    use std::{collections::BTreeMap, net::SocketAddr};
     use tower::util::ServiceExt;
+
+    async fn spawn_codex_endpoint_server() -> SocketAddr {
+        async fn method_not_allowed() -> impl IntoResponse {
+            (
+                StatusCode::METHOD_NOT_ALLOWED,
+                axum::Json(json!({ "detail": "Method Not Allowed" })),
+            )
+        }
+
+        async fn codex_responses_handler(request: AxumRequest) -> impl IntoResponse {
+            let auth = request
+                .headers()
+                .get(http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            let body = to_bytes(request.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            let body: Value = serde_json::from_slice(&body).expect("json body");
+
+            assert_eq!(auth, "Bearer gateway-codex-token");
+            assert_eq!(
+                body.get("model").and_then(Value::as_str),
+                Some("gpt-5-codex")
+            );
+            assert_eq!(
+                body.get("instructions").and_then(Value::as_str),
+                Some("You are Codex.")
+            );
+            assert_eq!(body.get("store").and_then(Value::as_bool), Some(false));
+            assert_eq!(body.get("stream").and_then(Value::as_bool), Some(true));
+            assert_eq!(
+                body.pointer("/input/0/type").and_then(Value::as_str),
+                Some("message")
+            );
+            assert_eq!(
+                body.pointer("/input/0/content/0/text")
+                    .and_then(Value::as_str),
+                Some("hello")
+            );
+
+            let payload = concat!(
+                "event: response.created\n",
+                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_codex_123\",\"model\":\"gpt-5.1-codex\",\"output\":[]}}\n\n",
+                "event: response.output_text.delta\n",
+                "data: {\"type\":\"response.output_text.delta\",\"content_index\":0,\"delta\":\"hello \",\"item_id\":\"msg_codex_123\",\"output_index\":0}\n\n",
+                "event: response.output_text.delta\n",
+                "data: {\"type\":\"response.output_text.delta\",\"content_index\":0,\"delta\":\"from codex\",\"item_id\":\"msg_codex_123\",\"output_index\":0}\n\n",
+                "event: response.completed\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_codex_123\",\"model\":\"gpt-5.1-codex\",\"output\":[{\"id\":\"msg_codex_123\",\"type\":\"message\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"annotations\":[],\"text\":\"hello from codex\"}],\"role\":\"assistant\"}],\"usage\":{\"input_tokens\":5,\"output_tokens\":3,\"total_tokens\":8}}}\n\n"
+            );
+
+            ([(http::header::CONTENT_TYPE, "text/event-stream")], payload).into_response()
+        }
+
+        async fn codex_chat_handler() -> impl IntoResponse {
+            (
+                StatusCode::FORBIDDEN,
+                [
+                    (
+                        http::header::CONTENT_TYPE.as_str(),
+                        "text/html; charset=UTF-8",
+                    ),
+                    ("cf-mitigated", "challenge"),
+                ],
+                "<html><body>Enable JavaScript and cookies to continue</body></html>",
+            )
+                .into_response()
+        }
+
+        let app = Router::new()
+            .route(
+                "/backend-api/codex/responses",
+                get(method_not_allowed).post(codex_responses_handler),
+            )
+            .route(
+                "/backend-api/codex/chat/completions",
+                post(codex_chat_handler),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+        addr
+    }
+
+    async fn spawn_codex_tool_call_server() -> SocketAddr {
+        async fn codex_responses_handler(request: AxumRequest) -> impl IntoResponse {
+            let auth = request
+                .headers()
+                .get(http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            let body = to_bytes(request.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            let body: Value = serde_json::from_slice(&body).expect("json body");
+
+            assert_eq!(auth, "Bearer gateway-codex-token");
+            assert_eq!(
+                body.pointer("/tools/0/type").and_then(Value::as_str),
+                Some("function")
+            );
+            assert_eq!(
+                body.pointer("/tools/0/name").and_then(Value::as_str),
+                Some("get_weather")
+            );
+            assert_eq!(
+                body.pointer("/input/0/content/0/type")
+                    .and_then(Value::as_str),
+                Some("input_text")
+            );
+            assert_eq!(
+                body.pointer("/input/0/content/0/text")
+                    .and_then(Value::as_str),
+                Some("What is the weather in Shanghai?")
+            );
+            assert_eq!(
+                body.pointer("/input/0/content/1/type")
+                    .and_then(Value::as_str),
+                Some("input_image")
+            );
+            assert_eq!(
+                body.pointer("/input/0/content/1/image_url")
+                    .and_then(Value::as_str),
+                Some("https://example.com/weather.png")
+            );
+
+            let payload = concat!(
+                "event: response.completed\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_tool_123\",\"model\":\"gpt-5.1-codex\",\"output\":[{\"id\":\"fc_123\",\"type\":\"function_call\",\"call_id\":\"call_weather_123\",\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"Shanghai\\\"}\"}],\"usage\":{\"input_tokens\":12,\"output_tokens\":4,\"total_tokens\":16}}}\n\n"
+            );
+
+            ([(http::header::CONTENT_TYPE, "text/event-stream")], payload).into_response()
+        }
+
+        let app = Router::new()
+            .route(
+                "/backend-api/codex/responses",
+                post(codex_responses_handler),
+            )
+            .fallback(|| async { (StatusCode::NOT_FOUND, Body::empty()) });
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+        addr
+    }
+
+    async fn spawn_codex_tool_result_server() -> SocketAddr {
+        async fn codex_responses_handler(request: AxumRequest) -> impl IntoResponse {
+            let auth = request
+                .headers()
+                .get(http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            let body = to_bytes(request.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            let body: Value = serde_json::from_slice(&body).expect("json body");
+
+            assert_eq!(auth, "Bearer gateway-codex-token");
+            assert_eq!(
+                body.get("previous_response_id").and_then(Value::as_str),
+                Some("resp_tool_123")
+            );
+            assert_eq!(
+                body.pointer("/input/0/type").and_then(Value::as_str),
+                Some("function_call")
+            );
+            assert_eq!(
+                body.pointer("/input/0/call_id").and_then(Value::as_str),
+                Some("call_weather_123")
+            );
+            assert_eq!(
+                body.pointer("/input/0/name").and_then(Value::as_str),
+                Some("get_weather")
+            );
+            assert_eq!(
+                body.pointer("/input/0/arguments").and_then(Value::as_str),
+                Some("{\"city\":\"Shanghai\"}")
+            );
+            assert_eq!(
+                body.pointer("/input/1/type").and_then(Value::as_str),
+                Some("function_call_output")
+            );
+            assert_eq!(
+                body.pointer("/input/1/call_id").and_then(Value::as_str),
+                Some("call_weather_123")
+            );
+            assert_eq!(
+                body.pointer("/input/1/output").and_then(Value::as_str),
+                Some("{\"temperature_c\":25}")
+            );
+
+            let payload = concat!(
+                "event: response.completed\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_tool_result_123\",\"model\":\"gpt-5.1-codex\",\"output\":[{\"id\":\"msg_tool_result_123\",\"type\":\"message\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"annotations\":[],\"text\":\"Shanghai is 25C.\"}],\"role\":\"assistant\"}],\"usage\":{\"input_tokens\":14,\"output_tokens\":4,\"total_tokens\":18}}}\n\n"
+            );
+
+            ([(http::header::CONTENT_TYPE, "text/event-stream")], payload).into_response()
+        }
+
+        let app = Router::new()
+            .route(
+                "/backend-api/codex/responses",
+                post(codex_responses_handler),
+            )
+            .fallback(|| async { (StatusCode::NOT_FOUND, Body::empty()) });
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+        addr
+    }
+
+    async fn spawn_codex_chat_tool_result_server() -> SocketAddr {
+        async fn codex_responses_handler(request: AxumRequest) -> impl IntoResponse {
+            let auth = request
+                .headers()
+                .get(http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            let body = to_bytes(request.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            let body: Value = serde_json::from_slice(&body).expect("json body");
+
+            assert_eq!(auth, "Bearer gateway-codex-token");
+            assert!(body.get("previous_response_id").is_none());
+            assert_eq!(
+                body.pointer("/input/0/type").and_then(Value::as_str),
+                Some("message")
+            );
+            assert_eq!(
+                body.pointer("/input/0/role").and_then(Value::as_str),
+                Some("user")
+            );
+            assert_eq!(
+                body.pointer("/input/0/content/0/text")
+                    .and_then(Value::as_str),
+                Some("What is the weather in Shanghai?")
+            );
+            assert_eq!(
+                body.pointer("/input/1/type").and_then(Value::as_str),
+                Some("function_call")
+            );
+            assert_eq!(
+                body.pointer("/input/1/call_id").and_then(Value::as_str),
+                Some("call_weather_123")
+            );
+            assert_eq!(
+                body.pointer("/input/1/name").and_then(Value::as_str),
+                Some("get_weather")
+            );
+            assert_eq!(
+                body.pointer("/input/1/arguments").and_then(Value::as_str),
+                Some("{\"city\":\"Shanghai\"}")
+            );
+            assert_eq!(
+                body.pointer("/input/2/type").and_then(Value::as_str),
+                Some("function_call_output")
+            );
+            assert_eq!(
+                body.pointer("/input/2/call_id").and_then(Value::as_str),
+                Some("call_weather_123")
+            );
+            assert_eq!(
+                body.pointer("/input/2/output").and_then(Value::as_str),
+                Some("{\"temperature_c\":25}")
+            );
+
+            let payload = concat!(
+                "event: response.completed\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_tool_result_123\",\"model\":\"gpt-5.1-codex\",\"output\":[{\"id\":\"msg_tool_result_123\",\"type\":\"message\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"annotations\":[],\"text\":\"Shanghai is 25C.\"}],\"role\":\"assistant\"}],\"usage\":{\"input_tokens\":14,\"output_tokens\":4,\"total_tokens\":18}}}\n\n"
+            );
+
+            ([(http::header::CONTENT_TYPE, "text/event-stream")], payload).into_response()
+        }
+
+        let app = Router::new()
+            .route(
+                "/backend-api/codex/responses",
+                post(codex_responses_handler),
+            )
+            .fallback(|| async { (StatusCode::NOT_FOUND, Body::empty()) });
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+        addr
+    }
+
+    async fn state_with_codex_route(api_base: &str) -> GatewayAppState {
+        let state = GatewayAppState::demo();
+        let account = state
+            .store
+            .ingest_provider_account(
+                ProviderAccountEnvelope {
+                    provider: "openai_codex".to_string(),
+                    credential_kind: "oauth_tokens".to_string(),
+                    payload_version: "v1".to_string(),
+                    credentials: json!({
+                        "access_token": "gateway-codex-token",
+                        "account_id": "acct_gateway_codex",
+                        "api_base": api_base
+                    }),
+                    metadata: json!({ "email": "gateway@example.com" }),
+                    labels: vec![],
+                    tags: BTreeMap::new(),
+                },
+                ValidatedProviderAccount {
+                    provider_account_id: "acct_gateway_codex".to_string(),
+                    redacted_display: Some("g***@***".to_string()),
+                    expires_at: None,
+                },
+                AccountCapabilities {
+                    models: vec![ModelDescriptor {
+                        id: "gpt-5-codex".to_string(),
+                        route_group: "gpt-5-codex".to_string(),
+                        provider_kind: "openai_codex".to_string(),
+                        upstream_model: "gpt-5-codex".to_string(),
+                        capabilities: vec![
+                            ModelCapability::Chat,
+                            ModelCapability::Responses,
+                            ModelCapability::Streaming,
+                        ],
+                    }],
+                    supports_refresh: true,
+                    supports_quota_probe: false,
+                },
+            )
+            .await
+            .expect("provider account");
+        let route_group = state
+            .store
+            .create_route_group(
+                "gpt-5-codex".to_string(),
+                "openai_codex".to_string(),
+                "gpt-5-codex".to_string(),
+            )
+            .await
+            .expect("route group");
+        state
+            .store
+            .bind_provider_account(route_group.id, account.id, 100, 16)
+            .await
+            .expect("binding");
+        state
+    }
+
+    async fn demo_tenant_id(state: &GatewayAppState) -> uuid::Uuid {
+        state
+            .store
+            .list_tenants()
+            .await
+            .expect("tenants")
+            .first()
+            .expect("tenant")
+            .id
+    }
 
     #[tokio::test]
     async fn models_endpoint_requires_valid_key() {
@@ -586,7 +1329,14 @@ mod tests {
     #[tokio::test]
     async fn newly_created_tenant_key_can_access_gateway() {
         let state = GatewayAppState::demo();
-        let tenant_id = state.store.list_tenants().await[0].id;
+        let tenant_id = state
+            .store
+            .list_tenants()
+            .await
+            .expect("tenants")
+            .first()
+            .expect("tenant")
+            .id;
         let created = state
             .store
             .create_tenant_api_key(tenant_id, "integration".to_string())
@@ -613,5 +1363,444 @@ mod tests {
             .await
             .expect("body");
         assert!(String::from_utf8_lossy(&body).contains("gpt-4.1-mini"));
+    }
+
+    #[tokio::test]
+    async fn responses_endpoint_routes_codex_requests_and_records_usage() {
+        let addr = spawn_codex_endpoint_server().await;
+        let state = state_with_codex_route(&format!("http://{addr}/backend-api/codex")).await;
+        let tenant_id = demo_tenant_id(&state).await;
+        let app = app(state.clone());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/v1/responses")
+                    .header(http::header::AUTHORIZATION, "Bearer fgk_demo_gateway_key")
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "gpt-5-codex",
+                            "input": "hello"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(body.get("object").and_then(Value::as_str), Some("response"));
+        assert_eq!(
+            body.get("model").and_then(Value::as_str),
+            Some("gpt-5.1-codex")
+        );
+        assert_eq!(
+            body.pointer("/output/0/content/0/text")
+                .and_then(Value::as_str),
+            Some("hello from codex")
+        );
+        assert_eq!(
+            body.pointer("/usage/total_tokens").and_then(Value::as_u64),
+            Some(8)
+        );
+
+        let requests = state
+            .store
+            .tenant_requests(tenant_id)
+            .await
+            .expect("requests");
+        let record = requests
+            .into_iter()
+            .find(|request| request.public_model == "gpt-5-codex")
+            .expect("recorded request");
+        assert_eq!(record.provider_kind, "openai_codex");
+        assert_eq!(record.status_code, 200);
+        assert_eq!(record.usage.total_tokens, 8);
+    }
+
+    #[tokio::test]
+    async fn models_endpoint_only_lists_route_groups_supported_by_bound_upstream_account() {
+        let state = GatewayAppState::demo();
+        let route_group = state
+            .store
+            .create_route_group(
+                "gpt-5-codex".to_string(),
+                "openai_codex".to_string(),
+                "gpt-5-codex".to_string(),
+            )
+            .await
+            .expect("route group");
+        let account_id = state
+            .store
+            .list_provider_accounts()
+            .await
+            .expect("accounts")
+            .first()
+            .expect("account")
+            .id;
+        state
+            .store
+            .bind_provider_account(route_group.id, account_id, 100, 16)
+            .await
+            .expect("binding");
+
+        let app = app(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models")
+                    .header(http::header::AUTHORIZATION, "Bearer fgk_demo_gateway_key")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("gpt-4.1-mini"));
+        assert!(!body.contains("gpt-5-codex"));
+    }
+
+    #[tokio::test]
+    async fn chat_completions_supports_image_inputs_and_tool_calls() {
+        let addr = spawn_codex_tool_call_server().await;
+        let state = state_with_codex_route(&format!("http://{addr}/backend-api/codex")).await;
+        let app = app(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/v1/chat/completions")
+                    .header(http::header::AUTHORIZATION, "Bearer fgk_demo_gateway_key")
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "gpt-5-codex",
+                            "messages": [{
+                                "role": "user",
+                                "content": [
+                                    { "type": "text", "text": "What is the weather in Shanghai?" },
+                                    {
+                                        "type": "image_url",
+                                        "image_url": { "url": "https://example.com/weather.png" }
+                                    }
+                                ]
+                            }],
+                            "tools": [{
+                                "type": "function",
+                                "function": {
+                                    "name": "get_weather",
+                                    "description": "Fetch current weather",
+                                    "parameters": {
+                                        "type": "object",
+                                        "properties": {
+                                            "city": { "type": "string" }
+                                        },
+                                        "required": ["city"]
+                                    }
+                                }
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(
+            body.pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str),
+            Some("tool_calls")
+        );
+        assert!(body.pointer("/choices/0/message/content").is_some());
+        assert_eq!(
+            body.pointer("/choices/0/message/tool_calls/0/function/name")
+                .and_then(Value::as_str),
+            Some("get_weather")
+        );
+        assert_eq!(
+            body.pointer("/choices/0/message/tool_calls/0/function/arguments")
+                .and_then(Value::as_str),
+            Some("{\"city\":\"Shanghai\"}")
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_supports_image_inputs_and_tool_calls() {
+        let addr = spawn_codex_tool_call_server().await;
+        let state = state_with_codex_route(&format!("http://{addr}/backend-api/codex")).await;
+        let app = app(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/v1/responses")
+                    .header(http::header::AUTHORIZATION, "Bearer fgk_demo_gateway_key")
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "gpt-5-codex",
+                            "input": [{
+                                "type": "message",
+                                "role": "user",
+                                "content": [
+                                    { "type": "input_text", "text": "What is the weather in Shanghai?" },
+                                    {
+                                        "type": "input_image",
+                                        "image_url": "https://example.com/weather.png"
+                                    }
+                                ]
+                            }],
+                            "tools": [{
+                                "type": "function",
+                                "function": {
+                                    "name": "get_weather",
+                                    "description": "Fetch current weather",
+                                    "parameters": {
+                                        "type": "object",
+                                        "properties": {
+                                            "city": { "type": "string" }
+                                        },
+                                        "required": ["city"]
+                                    }
+                                }
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(body.get("object").and_then(Value::as_str), Some("response"));
+        assert_eq!(
+            body.pointer("/output/0/type").and_then(Value::as_str),
+            Some("function_call")
+        );
+        assert_eq!(
+            body.pointer("/output/0/name").and_then(Value::as_str),
+            Some("get_weather")
+        );
+        assert_eq!(
+            body.pointer("/output/0/arguments").and_then(Value::as_str),
+            Some("{\"city\":\"Shanghai\"}")
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_completions_supports_tool_result_roundtrip() {
+        let addr = spawn_codex_chat_tool_result_server().await;
+        let state = state_with_codex_route(&format!("http://{addr}/backend-api/codex")).await;
+        let app = app(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/v1/chat/completions")
+                    .header(http::header::AUTHORIZATION, "Bearer fgk_demo_gateway_key")
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "gpt-5-codex",
+                            "messages": [
+                                {
+                                    "role": "user",
+                                    "content": "What is the weather in Shanghai?"
+                                },
+                                {
+                                    "role": "assistant",
+                                    "content": "",
+                                    "tool_calls": [{
+                                        "id": "call_weather_123",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "get_weather",
+                                            "arguments": "{\"city\":\"Shanghai\"}"
+                                        }
+                                    }]
+                                },
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": "call_weather_123",
+                                    "content": "{\"temperature_c\":25}"
+                                }
+                            ],
+                            "tools": [{
+                                "type": "function",
+                                "function": {
+                                    "name": "get_weather",
+                                    "description": "Fetch current weather",
+                                    "parameters": {
+                                        "type": "object",
+                                        "properties": {
+                                            "city": { "type": "string" }
+                                        },
+                                        "required": ["city"]
+                                    }
+                                }
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(
+            body.pointer("/choices/0/message/content")
+                .and_then(Value::as_str),
+            Some("Shanghai is 25C.")
+        );
+        assert_eq!(
+            body.pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str),
+            Some("stop")
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_support_previous_response_ids_and_function_call_outputs() {
+        let addr = spawn_codex_tool_result_server().await;
+        let state = state_with_codex_route(&format!("http://{addr}/backend-api/codex")).await;
+        let app = app(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/v1/responses")
+                    .header(http::header::AUTHORIZATION, "Bearer fgk_demo_gateway_key")
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "gpt-5-codex",
+                            "previous_response_id": "resp_tool_123",
+                            "input": [
+                                {
+                                    "type": "function_call",
+                                    "call_id": "call_weather_123",
+                                    "name": "get_weather",
+                                    "arguments": "{\"city\":\"Shanghai\"}"
+                                },
+                                {
+                                    "type": "function_call_output",
+                                    "call_id": "call_weather_123",
+                                    "output": "{\"temperature_c\":25}"
+                                }
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(
+            body.pointer("/output/0/content/0/text")
+                .and_then(Value::as_str),
+            Some("Shanghai is 25C.")
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_completions_streaming_endpoint_wraps_codex_output_as_openai_chunks() {
+        let addr = spawn_codex_endpoint_server().await;
+        let state = state_with_codex_route(&format!("http://{addr}/backend-api/codex")).await;
+        let tenant_id = demo_tenant_id(&state).await;
+        let app = app(state.clone());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/v1/chat/completions")
+                    .header(http::header::AUTHORIZATION, "Bearer fgk_demo_gateway_key")
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "gpt-5-codex",
+                            "stream": true,
+                            "messages": [{
+                                "role": "user",
+                                "content": "hello"
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .contains("text/event-stream")
+        );
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("\"object\":\"chat.completion.chunk\""));
+        assert!(body.contains("\"content\":\"hello \""));
+        assert!(body.contains("\"content\":\"from codex\""));
+        assert!(body.contains("[DONE]"));
+
+        let requests = state
+            .store
+            .tenant_requests(tenant_id)
+            .await
+            .expect("requests");
+        let record = requests
+            .into_iter()
+            .find(|request| request.public_model == "gpt-5-codex")
+            .expect("recorded request");
+        assert_eq!(record.provider_kind, "openai_codex");
+        assert_eq!(record.status_code, 200);
+        assert_eq!(record.usage.total_tokens, 8);
     }
 }

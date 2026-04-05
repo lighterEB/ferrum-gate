@@ -9,29 +9,27 @@ use axum::{
 use provider_core::{ProviderAccountEnvelope, ProviderRegistry};
 use provider_openai_codex::OpenAiCodexProvider;
 use scheduler::AccountState;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::net::SocketAddr;
-use storage::{AuthError, InMemoryPlatformStore, Permission, ScopeTarget, ServiceAccountPrincipal};
+use std::{net::SocketAddr, sync::Arc};
+use storage::{AuthError, Permission, PlatformStore, ScopeTarget, ServiceAccountPrincipal};
 use tracing::info;
 use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct ControlPlaneState {
-    pub store: InMemoryPlatformStore,
+    pub store: PlatformStore,
     pub registry: ProviderRegistry,
 }
 
 impl ControlPlaneState {
     #[must_use]
     pub fn demo() -> Self {
+        let store = PlatformStore::demo();
         let mut registry = ProviderRegistry::new();
-        registry.register(OpenAiCodexProvider::shared());
+        registry.register(OpenAiCodexProvider::shared(Arc::new(store.clone())));
 
-        Self {
-            store: InMemoryPlatformStore::demo(),
-            registry,
-        }
+        Self { store, registry }
     }
 }
 
@@ -40,6 +38,10 @@ pub fn app(state: ControlPlaneState) -> Router {
         .route(
             "/internal/v1/provider-accounts",
             get(list_provider_accounts).post(import_provider_account),
+        )
+        .route(
+            "/external/v1/provider-accounts/upload",
+            post(upload_provider_account),
         )
         .route(
             "/internal/v1/provider-accounts/{id}/enable",
@@ -85,9 +87,41 @@ async fn import_provider_account(
     headers: HeaderMap,
     Json(envelope): Json<ProviderAccountEnvelope>,
 ) -> Response {
-    let principal = match authorize(
+    import_provider_account_via(
         &state,
         &headers,
+        envelope,
+        "provider_account.imported",
+        "internal_control_plane",
+    )
+    .await
+}
+
+async fn upload_provider_account(
+    State(state): State<ControlPlaneState>,
+    headers: HeaderMap,
+    Json(envelope): Json<ProviderAccountEnvelope>,
+) -> Response {
+    import_provider_account_via(
+        &state,
+        &headers,
+        envelope,
+        "provider_account.uploaded",
+        "external_upload_api",
+    )
+    .await
+}
+
+async fn import_provider_account_via(
+    state: &ControlPlaneState,
+    headers: &HeaderMap,
+    envelope: ProviderAccountEnvelope,
+    audit_action: &str,
+    source: &str,
+) -> Response {
+    let principal = match authorize(
+        state,
+        headers,
         Permission::ImportProviderAccounts,
         ScopeTarget::ProviderPool(envelope.provider.clone()),
     )
@@ -105,27 +139,41 @@ async fn import_provider_account(
         Ok(validated) => validated,
         Err(error) => return control_error(StatusCode::BAD_REQUEST, &error.message),
     };
-    let capabilities = match provider.probe_capabilities(&validated).await {
+    let capabilities = match provider.probe_capabilities(&envelope, &validated).await {
         Ok(capabilities) => capabilities,
         Err(error) => return control_error(StatusCode::BAD_REQUEST, &error.message),
     };
 
-    let record = state
+    let record = match state
         .store
         .ingest_provider_account(envelope.clone(), validated, capabilities)
-        .await;
+        .await
+    {
+        Ok(record) => record,
+        Err(error) => return control_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
     state
         .store
         .record_audit(
             principal.subject,
-            "provider_account.imported",
+            audit_action,
             format!("provider_account:{}", record.id),
             Uuid::new_v4().to_string(),
-            json!({ "provider": envelope.provider }),
+            json!({
+                "provider": envelope.provider,
+                "credential_kind": envelope.credential_kind,
+                "source": source,
+            }),
         )
-        .await;
+        .await
+        .ok();
 
-    Json(json!(record)).into_response()
+    Json(json!(ProviderAccountUploadResponse {
+        status: "imported",
+        source: source.to_string(),
+        provider_account: record,
+    }))
+    .into_response()
 }
 
 async fn list_provider_accounts(
@@ -144,10 +192,10 @@ async fn list_provider_accounts(
         return control_error(StatusCode::UNAUTHORIZED, "Unauthorized");
     }
 
-    Json(json!({
-      "data": state.store.list_provider_accounts().await
-    }))
-    .into_response()
+    match state.store.list_provider_accounts().await {
+        Ok(accounts) => Json(json!({ "data": accounts })).into_response(),
+        Err(error) => control_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    }
 }
 
 async fn enable_provider_account(
@@ -197,7 +245,7 @@ async fn mutate_provider_state(
         .set_provider_account_state(id, new_state.clone())
         .await
     {
-        Some(record) => {
+        Ok(Some(record)) => {
             state
                 .store
                 .record_audit(
@@ -207,10 +255,12 @@ async fn mutate_provider_state(
                     Uuid::new_v4().to_string(),
                     json!({ "state": format!("{new_state:?}") }),
                 )
-                .await;
+                .await
+                .ok();
             Json(json!(record)).into_response()
         }
-        None => control_error(StatusCode::NOT_FOUND, "Provider account not found"),
+        Ok(None) => control_error(StatusCode::NOT_FOUND, "Provider account not found"),
+        Err(error) => control_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     }
 }
 
@@ -231,14 +281,18 @@ async fn create_route_group(
         Err(response) => return response,
     };
 
-    let record = state
+    let record = match state
         .store
         .create_route_group(
             payload.public_model,
             payload.provider_kind,
             payload.upstream_model,
         )
-        .await;
+        .await
+    {
+        Ok(record) => record,
+        Err(error) => return control_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
     state
         .store
         .record_audit(
@@ -248,7 +302,8 @@ async fn create_route_group(
             Uuid::new_v4().to_string(),
             json!({ "public_model": record.public_model }),
         )
-        .await;
+        .await
+        .ok();
     Json(json!(record)).into_response()
 }
 
@@ -265,10 +320,10 @@ async fn list_route_groups(State(state): State<ControlPlaneState>, headers: Head
         return control_error(StatusCode::UNAUTHORIZED, "Unauthorized");
     }
 
-    Json(json!({
-      "data": state.store.list_route_groups().await
-    }))
-    .into_response()
+    match state.store.list_route_groups().await {
+        Ok(route_groups) => Json(json!({ "data": route_groups })).into_response(),
+        Err(error) => control_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    }
 }
 
 async fn bind_route_group(
@@ -309,10 +364,17 @@ async fn bind_route_group(
                     Uuid::new_v4().to_string(),
                     json!({ "provider_account_id": payload.provider_account_id }),
                 )
-                .await;
+                .await
+                .ok();
             Json(json!(binding)).into_response()
         }
-        Err(_) => control_error(StatusCode::BAD_REQUEST, "Failed to bind provider account"),
+        Err(AuthError::Unauthorized) => {
+            control_error(StatusCode::NOT_FOUND, "Failed to bind provider account")
+        }
+        Err(AuthError::Forbidden) => control_error(StatusCode::FORBIDDEN, "Forbidden"),
+        Err(AuthError::Storage(message)) => {
+            control_error(StatusCode::INTERNAL_SERVER_ERROR, &message)
+        }
     }
 }
 
@@ -329,10 +391,10 @@ async fn list_tenants(State(state): State<ControlPlaneState>, headers: HeaderMap
         return control_error(StatusCode::UNAUTHORIZED, "Unauthorized");
     }
 
-    Json(json!({
-      "data": state.store.list_tenants().await
-    }))
-    .into_response()
+    match state.store.list_tenants().await {
+        Ok(tenants) => Json(json!({ "data": tenants })).into_response(),
+        Err(error) => control_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    }
 }
 
 async fn create_tenant(
@@ -352,7 +414,10 @@ async fn create_tenant(
         Err(response) => return response,
     };
 
-    let tenant = state.store.create_tenant(payload.slug, payload.name).await;
+    let tenant = match state.store.create_tenant(payload.slug, payload.name).await {
+        Ok(tenant) => tenant,
+        Err(error) => return control_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
     state
         .store
         .record_audit(
@@ -362,7 +427,8 @@ async fn create_tenant(
             Uuid::new_v4().to_string(),
             json!({ "slug": tenant.slug }),
         )
-        .await;
+        .await
+        .ok();
     Json(json!(tenant)).into_response()
 }
 
@@ -374,10 +440,10 @@ async fn list_audit_events(State(state): State<ControlPlaneState>, headers: Head
         return control_error(StatusCode::UNAUTHORIZED, "Unauthorized");
     }
 
-    Json(json!({
-      "data": state.store.list_audit_events().await
-    }))
-    .into_response()
+    match state.store.list_audit_events().await {
+        Ok(events) => Json(json!({ "data": events })).into_response(),
+        Err(error) => control_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    }
 }
 
 async fn authorize(
@@ -400,6 +466,9 @@ async fn authorize(
         .map_err(|error| match error {
             AuthError::Unauthorized => control_error(StatusCode::UNAUTHORIZED, "Unauthorized"),
             AuthError::Forbidden => control_error(StatusCode::FORBIDDEN, "Forbidden"),
+            AuthError::Storage(message) => {
+                control_error(StatusCode::INTERNAL_SERVER_ERROR, &message)
+            }
         })
 }
 
@@ -445,17 +514,63 @@ struct CreateTenantRequest {
     name: String,
 }
 
+#[derive(Debug, Serialize)]
+struct ProviderAccountUploadResponse {
+    status: &'static str,
+    source: String,
+    provider_account: storage::ProviderAccountRecord,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::{
+        Router,
         body::{Body, to_bytes},
+        extract::Request as AxumRequest,
         http::Request,
+        response::IntoResponse,
+        routing::get,
     };
+    use serde_json::json;
+    use std::net::SocketAddr;
     use tower::util::ServiceExt;
+
+    async fn spawn_models_server() -> SocketAddr {
+        async fn models_handler(request: AxumRequest) -> impl IntoResponse {
+            let auth = request
+                .headers()
+                .get(http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+
+            assert_eq!(auth, "Bearer token");
+
+            axum::Json(json!({
+                "object": "list",
+                "data": [
+                    { "id": "gpt-5-codex" },
+                    { "id": "gpt-5-codex-mini" }
+                ]
+            }))
+            .into_response()
+        }
+
+        let app = Router::new().route("/v1/models", get(models_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+        addr
+    }
 
     #[tokio::test]
     async fn platform_admin_can_import_provider_account() {
+        let addr = spawn_models_server().await;
         let app = app(ControlPlaneState::demo());
         let response = app
             .oneshot(
@@ -465,15 +580,23 @@ mod tests {
                     .header(http::header::AUTHORIZATION, "Bearer fg_cp_admin_demo")
                     .header(http::header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
-                        r#"{
-              "provider":"openai_codex",
-              "credential_kind":"oauth_tokens",
-              "payload_version":"v1",
-              "credentials":{"access_token":"token","account_id":"acct_123"},
-              "metadata":{"email":"demo@example.com","plan_type":"plus"},
-              "labels":["shared"],
-              "tags":{"region":"global"}
-            }"#,
+                        json!({
+                            "provider": "openai_codex",
+                            "credential_kind": "oauth_tokens",
+                            "payload_version": "v1",
+                            "credentials": {
+                                "access_token": "token",
+                                "account_id": "acct_123",
+                                "api_base": format!("http://{addr}/v1")
+                            },
+                            "metadata": {
+                                "email": "demo@example.com",
+                                "plan_type": "plus"
+                            },
+                            "labels": ["shared"],
+                            "tags": { "region": "global" }
+                        })
+                        .to_string(),
                     ))
                     .expect("request"),
             )
@@ -484,6 +607,54 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("body");
-        assert!(String::from_utf8_lossy(&body).contains("openai_codex"));
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("openai_codex"));
+        assert!(body.contains("gpt-5-codex"));
+    }
+
+    #[tokio::test]
+    async fn external_upload_endpoint_imports_provider_account() {
+        let addr = spawn_models_server().await;
+        let app = app(ControlPlaneState::demo());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/external/v1/provider-accounts/upload")
+                    .header(http::header::AUTHORIZATION, "Bearer fg_cp_admin_demo")
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "provider": "openai_codex",
+                            "credential_kind": "oauth_tokens",
+                            "payload_version": "v1",
+                            "credentials": {
+                                "access_token": "token",
+                                "account_id": "acct_external_123",
+                                "api_base": format!("http://{addr}/v1")
+                            },
+                            "metadata": {
+                                "email": "external@example.com",
+                                "plan_type": "plus"
+                            },
+                            "labels": ["shared"],
+                            "tags": { "region": "global" }
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("\"status\":\"imported\""));
+        assert!(body.contains("\"source\":\"external_upload_api\""));
+        assert!(body.contains("acct_external_123"));
+        assert!(body.contains("gpt-5-codex-mini"));
     }
 }
