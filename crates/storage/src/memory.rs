@@ -444,6 +444,7 @@ impl InMemoryPlatformStore {
                     ModelCapability::Chat,
                     ModelCapability::Responses,
                     ModelCapability::Streaming,
+                    ModelCapability::Tools,
                 ],
             })
             .collect())

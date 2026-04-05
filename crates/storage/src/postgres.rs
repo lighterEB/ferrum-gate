@@ -513,6 +513,7 @@ impl PostgresPlatformStore {
                     ModelCapability::Chat,
                     ModelCapability::Responses,
                     ModelCapability::Streaming,
+                    ModelCapability::Tools,
                 ],
             })
             .collect())

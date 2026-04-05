@@ -281,6 +281,10 @@ async fn create_route_group(
         Err(response) => return response,
     };
 
+    if state.registry.get(&payload.provider_kind).is_none() {
+        return control_error(StatusCode::BAD_REQUEST, "Provider adapter not registered");
+    }
+
     let record = match state
         .store
         .create_route_group(
@@ -343,6 +347,32 @@ async fn bind_route_group(
         Ok(principal) => principal,
         Err(response) => return response,
     };
+
+    let route_groups = match state.store.list_route_groups().await {
+        Ok(route_groups) => route_groups,
+        Err(error) => return control_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
+    let provider_accounts = match state.store.list_provider_accounts().await {
+        Ok(provider_accounts) => provider_accounts,
+        Err(error) => return control_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
+    let route_group_provider = route_groups
+        .iter()
+        .find(|route_group| route_group.id == route_group_id)
+        .map(|route_group| route_group.provider_kind.as_str());
+    let provider_account_provider = provider_accounts
+        .iter()
+        .find(|account| account.id == payload.provider_account_id)
+        .map(|account| account.provider.as_str());
+    if let (Some(route_group_provider), Some(provider_account_provider)) =
+        (route_group_provider, provider_account_provider)
+        && route_group_provider != provider_account_provider
+    {
+        return control_error(
+            StatusCode::BAD_REQUEST,
+            "Route group provider does not match provider account",
+        );
+    }
 
     match state
         .store
@@ -532,6 +562,7 @@ mod tests {
         response::IntoResponse,
         routing::get,
     };
+    use provider_core::{AccountCapabilities, ProviderAccountEnvelope, ValidatedProviderAccount};
     use serde_json::json;
     use std::net::SocketAddr;
     use tower::util::ServiceExt;
@@ -656,5 +687,108 @@ mod tests {
         assert!(body.contains("\"source\":\"external_upload_api\""));
         assert!(body.contains("acct_external_123"));
         assert!(body.contains("gpt-5-codex-mini"));
+    }
+
+    #[tokio::test]
+    async fn create_route_group_rejects_unregistered_provider_kind() {
+        let app = app(ControlPlaneState::demo());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/v1/route-groups")
+                    .header(http::header::AUTHORIZATION, "Bearer fg_cp_admin_demo")
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "public_model": "qwen-max",
+                            "provider_kind": "qwen",
+                            "upstream_model": "qwen-max"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("Provider adapter not registered"));
+    }
+
+    #[tokio::test]
+    async fn bind_route_group_rejects_provider_mismatch() {
+        let state = ControlPlaneState::demo();
+        let route_group = state
+            .store
+            .create_route_group(
+                "gpt-5-codex".to_string(),
+                "openai_codex".to_string(),
+                "gpt-5-codex".to_string(),
+            )
+            .await
+            .expect("route group");
+        let mismatched_account = state
+            .store
+            .ingest_provider_account(
+                ProviderAccountEnvelope {
+                    provider: "qwen".to_string(),
+                    credential_kind: "api_key".to_string(),
+                    payload_version: "v1".to_string(),
+                    credentials: json!({
+                        "api_key": "test-key"
+                    }),
+                    metadata: json!({}),
+                    labels: vec![],
+                    tags: Default::default(),
+                },
+                ValidatedProviderAccount {
+                    provider_account_id: "acct_qwen".to_string(),
+                    redacted_display: None,
+                    expires_at: None,
+                },
+                AccountCapabilities {
+                    models: vec![],
+                    supports_refresh: false,
+                    supports_quota_probe: false,
+                },
+            )
+            .await
+            .expect("provider account");
+        let app = app(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/internal/v1/route-groups/{}/bindings",
+                        route_group.id
+                    ))
+                    .header(http::header::AUTHORIZATION, "Bearer fg_cp_admin_demo")
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "provider_account_id": mismatched_account.id,
+                            "weight": 100,
+                            "max_in_flight": 16
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("Route group provider does not match provider account"));
     }
 }

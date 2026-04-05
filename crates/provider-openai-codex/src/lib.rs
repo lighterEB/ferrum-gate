@@ -365,18 +365,14 @@ impl OpenAiCodexProvider {
         let model = self.effective_model(request, &connection);
         let tools = Self::tool_payloads(request);
         let payload = if Self::uses_chatgpt_codex_endpoint(connection) {
-            let mut payload = json!({
+            json!({
                 "model": model,
                 "instructions": Self::codex_instructions(request),
                 "input": Self::codex_input_items(request),
                 "tools": tools,
                 "stream": true,
                 "store": false
-            });
-            if let Some(previous_response_id) = &request.previous_response_id {
-                payload["previous_response_id"] = Value::String(previous_response_id.clone());
-            }
-            payload
+            })
         } else {
             let mut payload = json!({
                 "model": model,
@@ -1085,11 +1081,25 @@ async fn ensure_success(response: Response) -> Result<Response, ProviderError> {
         return Ok(response);
     }
 
+    let headers = response.headers().clone();
     let body = response.text().await.unwrap_or_default();
-    Err(http_status_error(status, &body))
+    Err(http_status_error(status, &headers, &body))
 }
 
-fn http_status_error(status: StatusCode, body: &str) -> ProviderError {
+fn http_status_error(status: StatusCode, headers: &HeaderMap, body: &str) -> ProviderError {
+    if headers
+        .get("cf-mitigated")
+        .and_then(|value| value.to_str().ok())
+        == Some("challenge")
+    {
+        return ProviderError::new(
+            ProviderErrorKind::UpstreamUnavailable,
+            503,
+            "Upstream challenge requires interactive verification.",
+        )
+        .with_code("upstream_challenge");
+    }
+
     let kind = match status.as_u16() {
         400 | 404 => ProviderErrorKind::InvalidRequest,
         401 | 403 => ProviderErrorKind::InvalidCredentials,
@@ -1098,24 +1108,18 @@ fn http_status_error(status: StatusCode, body: &str) -> ProviderError {
         _ => ProviderErrorKind::Unsupported,
     };
 
-    let message = serde_json::from_str::<Value>(body)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("error")
-                .and_then(|error| error.get("message"))
-                .and_then(Value::as_str)
-                .map(ToString::to_string)
-                .or_else(|| {
-                    value
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .map(ToString::to_string)
-                })
-        })
+    let parsed = serde_json::from_str::<Value>(body).ok();
+    let message = parsed
+        .as_ref()
+        .and_then(extract_upstream_error_message)
         .unwrap_or_else(|| format!("upstream returned {status}"));
+    let code = parsed.as_ref().and_then(extract_upstream_error_code);
 
-    ProviderError::new(kind, status.as_u16(), message)
+    let error = ProviderError::new(kind, status.as_u16(), message);
+    match code {
+        Some(code) => error.with_code(code),
+        None => error,
+    }
 }
 
 fn transport_error(error: impl ToString) -> ProviderError {
@@ -1326,21 +1330,13 @@ fn parse_stream_error(payload: &str) -> ProviderError {
     serde_json::from_str::<Value>(payload)
         .ok()
         .and_then(|value| {
-            value
-                .get("message")
-                .and_then(Value::as_str)
-                .map(|message| {
-                    ProviderError::new(ProviderErrorKind::UpstreamUnavailable, 502, message)
-                })
-                .or_else(|| {
-                    value
-                        .get("error")
-                        .and_then(|error| error.get("message"))
-                        .and_then(Value::as_str)
-                        .map(|message| {
-                            ProviderError::new(ProviderErrorKind::UpstreamUnavailable, 502, message)
-                        })
-                })
+            let message = extract_upstream_error_message(&value)?;
+            let (kind, status_code) = infer_stream_error_kind_and_status(&value);
+            let error = ProviderError::new(kind, status_code, message);
+            Some(match extract_upstream_error_code(&value) {
+                Some(code) => error.with_code(code),
+                None => error,
+            })
         })
         .unwrap_or_else(|| {
             ProviderError::new(
@@ -1349,6 +1345,61 @@ fn parse_stream_error(payload: &str) -> ProviderError {
                 "upstream stream failed",
             )
         })
+}
+
+fn extract_upstream_error_message(value: &Value) -> Option<String> {
+    value
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .or_else(|| {
+            value
+                .get("message")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+}
+
+fn extract_upstream_error_code(value: &Value) -> Option<String> {
+    value
+        .get("error")
+        .and_then(|error| error.get("code"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .or_else(|| {
+            value
+                .get("code")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+}
+
+fn extract_upstream_error_type(value: &Value) -> Option<String> {
+    value
+        .get("error")
+        .and_then(|error| error.get("type"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .or_else(|| {
+            value
+                .get("type")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+}
+
+fn infer_stream_error_kind_and_status(value: &Value) -> (ProviderErrorKind, u16) {
+    match extract_upstream_error_code(value).as_deref() {
+        Some("token_invalidated") => (ProviderErrorKind::InvalidCredentials, 401),
+        Some("rate_limited") | Some("insufficient_quota") => (ProviderErrorKind::RateLimited, 429),
+        _ => match extract_upstream_error_type(value).as_deref() {
+            Some("invalid_request_error") => (ProviderErrorKind::InvalidRequest, 400),
+            Some("rate_limit_error") => (ProviderErrorKind::RateLimited, 429),
+            Some("authentication_error") => (ProviderErrorKind::InvalidCredentials, 401),
+            _ => (ProviderErrorKind::UpstreamUnavailable, 502),
+        },
+    }
 }
 
 fn redact_email(email: &str) -> String {
@@ -1706,7 +1757,7 @@ mod tests {
         addr
     }
 
-    async fn spawn_codex_tool_result_server() -> SocketAddr {
+    async fn spawn_codex_token_invalidated_server() -> SocketAddr {
         async fn codex_responses_handler(request: Request) -> impl IntoResponse {
             let auth = request
                 .headers()
@@ -1721,9 +1772,103 @@ mod tests {
 
             assert_eq!(auth, "Bearer test-token");
             assert_eq!(
-                body.get("previous_response_id").and_then(Value::as_str),
-                Some("resp_tool_123")
+                body.get("model").and_then(Value::as_str),
+                Some("gpt-5-codex")
             );
+
+            (
+                HttpStatusCode::UNAUTHORIZED,
+                axum::Json(json!({
+                    "error": {
+                        "message": "Your authentication token has been invalidated. Please try signing in again.",
+                        "type": "invalid_request_error",
+                        "code": "token_invalidated",
+                        "param": Value::Null
+                    }
+                })),
+            )
+                .into_response()
+        }
+
+        let app = Router::new()
+            .route(
+                "/backend-api/codex/responses",
+                post(codex_responses_handler),
+            )
+            .fallback(|| async { (HttpStatusCode::NOT_FOUND, Body::empty()) });
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+        addr
+    }
+
+    async fn spawn_codex_challenge_server() -> SocketAddr {
+        async fn codex_responses_handler(request: Request) -> impl IntoResponse {
+            let auth = request
+                .headers()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            let body = axum::body::to_bytes(request.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            let body: Value = serde_json::from_slice(&body).expect("json body");
+
+            assert_eq!(auth, "Bearer test-token");
+            assert_eq!(
+                body.get("model").and_then(Value::as_str),
+                Some("gpt-5-codex")
+            );
+
+            (
+                HttpStatusCode::FORBIDDEN,
+                [
+                    ("content-type", "text/html; charset=UTF-8"),
+                    ("cf-mitigated", "challenge"),
+                ],
+                "<html><body>Enable JavaScript and cookies to continue</body></html>",
+            )
+                .into_response()
+        }
+
+        let app = Router::new()
+            .route(
+                "/backend-api/codex/responses",
+                post(codex_responses_handler),
+            )
+            .fallback(|| async { (HttpStatusCode::NOT_FOUND, Body::empty()) });
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+        addr
+    }
+
+    async fn spawn_codex_tool_result_server() -> SocketAddr {
+        async fn codex_responses_handler(request: Request) -> impl IntoResponse {
+            let auth = request
+                .headers()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            let body = axum::body::to_bytes(request.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            let body: Value = serde_json::from_slice(&body).expect("json body");
+
+            assert_eq!(auth, "Bearer test-token");
+            assert!(body.get("previous_response_id").is_none());
             assert_eq!(
                 body.pointer("/input/0/type").and_then(Value::as_str),
                 Some("function_call")
@@ -2104,6 +2249,47 @@ mod tests {
         assert_eq!(response.model, "gpt-5.1-codex");
         assert_eq!(response.output_text, "hello from codex");
         assert_eq!(response.usage.total_tokens, 8);
+    }
+
+    #[tokio::test]
+    async fn responses_on_codex_endpoint_preserves_token_invalidated_code() {
+        let addr = spawn_codex_token_invalidated_server().await;
+        let (provider, mut request, _) =
+            setup_provider(&format!("http://{addr}/backend-api/codex")).await;
+        request.public_model = "gpt-5-codex".to_string();
+        request.upstream_model = Some("gpt-5-codex".to_string());
+
+        let error = provider
+            .responses(request)
+            .await
+            .expect_err("token invalidated");
+
+        assert_eq!(error.kind, ProviderErrorKind::InvalidCredentials);
+        assert_eq!(error.status_code, 401);
+        assert_eq!(error.code.as_deref(), Some("token_invalidated"));
+        assert_eq!(
+            error.message,
+            "Your authentication token has been invalidated. Please try signing in again."
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_on_codex_endpoint_maps_cloudflare_challenge() {
+        let addr = spawn_codex_challenge_server().await;
+        let (provider, mut request, _) =
+            setup_provider(&format!("http://{addr}/backend-api/codex")).await;
+        request.public_model = "gpt-5-codex".to_string();
+        request.upstream_model = Some("gpt-5-codex".to_string());
+
+        let error = provider.responses(request).await.expect_err("challenge");
+
+        assert_eq!(error.kind, ProviderErrorKind::UpstreamUnavailable);
+        assert_eq!(error.status_code, 503);
+        assert_eq!(error.code.as_deref(), Some("upstream_challenge"));
+        assert_eq!(
+            error.message,
+            "Upstream challenge requires interactive verification."
+        );
     }
 
     #[tokio::test]

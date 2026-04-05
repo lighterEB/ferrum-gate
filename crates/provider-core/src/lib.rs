@@ -86,6 +86,8 @@ pub struct ProviderError {
     pub kind: ProviderErrorKind,
     pub message: String,
     pub status_code: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
 }
 
 impl ProviderError {
@@ -95,7 +97,14 @@ impl ProviderError {
             kind,
             message: message.into(),
             status_code,
+            code: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_code(mut self, code: impl Into<String>) -> Self {
+        self.code = Some(code.into());
+        self
     }
 }
 
