@@ -1,0 +1,12 @@
+[package]
+name = "scheduler"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+chrono.workspace = true
+serde.workspace = true
+uuid.workspace = true

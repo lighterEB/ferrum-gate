@@ -1,0 +1,28 @@
+[package]
+name = "gateway-http"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-stream.workspace = true
+axum.workspace = true
+chrono.workspace = true
+futures.workspace = true
+http.workspace = true
+observability = { path = "../../crates/observability" }
+protocol-core = { path = "../../crates/protocol-core" }
+provider-core = { path = "../../crates/provider-core" }
+provider-openai-codex = { path = "../../crates/provider-openai-codex" }
+scheduler = { path = "../../crates/scheduler" }
+serde.workspace = true
+serde_json.workspace = true
+storage = { path = "../../crates/storage" }
+tokio.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+uuid.workspace = true

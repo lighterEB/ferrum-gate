@@ -1,0 +1,258 @@
+use anyhow::Result;
+use axum::{
+    Router,
+    extract::{Path, State},
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Json, Response},
+    routing::{get, post},
+};
+use serde::Deserialize;
+use serde_json::{Value, json};
+use std::net::SocketAddr;
+use storage::{InMemoryPlatformStore, TenantManagementPrincipal};
+use tracing::info;
+use uuid::Uuid;
+
+#[derive(Clone)]
+pub struct TenantApiState {
+    pub store: InMemoryPlatformStore,
+}
+
+impl TenantApiState {
+    #[must_use]
+    pub fn demo() -> Self {
+        Self {
+            store: InMemoryPlatformStore::demo(),
+        }
+    }
+}
+
+pub fn app(state: TenantApiState) -> Router {
+    Router::new()
+        .route("/tenant/v1/me", get(me))
+        .route("/tenant/v1/models", get(models))
+        .route(
+            "/tenant/v1/api-keys",
+            get(list_api_keys).post(create_api_key),
+        )
+        .route("/tenant/v1/api-keys/{id}/rotate", post(rotate_api_key))
+        .route("/tenant/v1/api-keys/{id}/revoke", post(revoke_api_key))
+        .route("/tenant/v1/usage", get(usage))
+        .route("/tenant/v1/requests", get(requests))
+        .route("/tenant/v1/limits", get(limits))
+        .with_state(state)
+}
+
+pub async fn run(addr: SocketAddr, state: TenantApiState) -> Result<()> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    info!("tenant-api listening on {addr}");
+    axum::serve(listener, app(state)).await?;
+    Ok(())
+}
+
+async fn me(State(state): State<TenantApiState>, headers: HeaderMap) -> Response {
+    let principal = match authenticate(&state, &headers).await {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+    let tenant = state
+        .store
+        .list_tenants()
+        .await
+        .into_iter()
+        .find(|tenant| tenant.id == principal.tenant_id);
+
+    match tenant {
+        Some(tenant) => Json(json!(tenant)).into_response(),
+        None => tenant_error(StatusCode::NOT_FOUND, "Tenant not found"),
+    }
+}
+
+async fn models(State(state): State<TenantApiState>, headers: HeaderMap) -> Response {
+    let principal = match authenticate(&state, &headers).await {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+
+    Json(json!({
+      "data": state.store.list_tenant_models(principal.tenant_id).await
+    }))
+    .into_response()
+}
+
+async fn list_api_keys(State(state): State<TenantApiState>, headers: HeaderMap) -> Response {
+    let principal = match authenticate(&state, &headers).await {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+    Json(json!({
+      "data": state.store.list_tenant_api_keys(principal.tenant_id).await
+    }))
+    .into_response()
+}
+
+async fn create_api_key(
+    State(state): State<TenantApiState>,
+    headers: HeaderMap,
+    Json(payload): Json<CreateApiKeyRequest>,
+) -> Response {
+    let principal = match authenticate(&state, &headers).await {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+
+    match state
+        .store
+        .create_tenant_api_key(principal.tenant_id, payload.label)
+        .await
+    {
+        Ok(created) => Json(json!(created)).into_response(),
+        Err(_) => tenant_error(StatusCode::BAD_REQUEST, "Failed to create API key"),
+    }
+}
+
+async fn rotate_api_key(
+    State(state): State<TenantApiState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let principal = match authenticate(&state, &headers).await {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+
+    match state
+        .store
+        .rotate_tenant_api_key(principal.tenant_id, id)
+        .await
+    {
+        Ok(created) => Json(json!(created)).into_response(),
+        Err(_) => tenant_error(StatusCode::BAD_REQUEST, "Failed to rotate API key"),
+    }
+}
+
+async fn revoke_api_key(
+    State(state): State<TenantApiState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let principal = match authenticate(&state, &headers).await {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+
+    match state
+        .store
+        .revoke_tenant_api_key(principal.tenant_id, id)
+        .await
+    {
+        Ok(record) => Json(json!(record)).into_response(),
+        Err(_) => tenant_error(StatusCode::BAD_REQUEST, "Failed to revoke API key"),
+    }
+}
+
+async fn usage(State(state): State<TenantApiState>, headers: HeaderMap) -> Response {
+    let principal = match authenticate(&state, &headers).await {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+
+    Json(json!(state.store.usage_summary(principal.tenant_id).await)).into_response()
+}
+
+async fn requests(State(state): State<TenantApiState>, headers: HeaderMap) -> Response {
+    let principal = match authenticate(&state, &headers).await {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+
+    Json(json!({
+      "data": state.store.tenant_requests(principal.tenant_id).await
+    }))
+    .into_response()
+}
+
+async fn limits() -> Json<Value> {
+    Json(json!({
+      "requests_per_minute": 60,
+      "burst": 10,
+      "concurrent_requests": 8
+    }))
+}
+
+async fn authenticate(
+    state: &TenantApiState,
+    headers: &HeaderMap,
+) -> Result<TenantManagementPrincipal, Response> {
+    let Some(token) = parse_bearer_token(headers) else {
+        return Err(tenant_error(
+            StatusCode::UNAUTHORIZED,
+            "Missing tenant management token",
+        ));
+    };
+    state
+        .store
+        .authenticate_tenant_management_token(&token)
+        .await
+        .ok_or_else(|| tenant_error(StatusCode::UNAUTHORIZED, "Invalid tenant management token"))
+}
+
+fn parse_bearer_token(headers: &HeaderMap) -> Option<String> {
+    let value = headers.get(http::header::AUTHORIZATION)?.to_str().ok()?;
+    value.strip_prefix("Bearer ").map(ToString::to_string)
+}
+
+fn tenant_error(status: StatusCode, message: &str) -> Response {
+    Json(json!({ "error": { "message": message } }))
+        .into_response()
+        .with_status(status)
+}
+
+trait ResponseExt {
+    fn with_status(self, status: StatusCode) -> Response;
+}
+
+impl ResponseExt for Response {
+    fn with_status(mut self, status: StatusCode) -> Response {
+        *self.status_mut() = status;
+        self
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateApiKeyRequest {
+    label: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        body::{Body, to_bytes},
+        http::Request,
+    };
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn tenant_admin_can_create_api_key() {
+        let app = app(TenantApiState::demo());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/tenant/v1/api-keys")
+                    .header(http::header::AUTHORIZATION, "Bearer fg_tenant_admin_demo")
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"label":"sdk"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert!(String::from_utf8_lossy(&body).contains("fgk_"));
+    }
+}

@@ -1,0 +1,146 @@
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FrontendProtocol {
+    OpenAi,
+    Anthropic,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MessageRole {
+    System,
+    User,
+    Assistant,
+    Tool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CanonicalMessage {
+    pub role: MessageRole,
+    pub content: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InferenceRequest {
+    pub protocol: FrontendProtocol,
+    pub public_model: String,
+    pub upstream_model: Option<String>,
+    pub stream: bool,
+    pub messages: Vec<CanonicalMessage>,
+    pub metadata: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelCapability {
+    Chat,
+    Responses,
+    Streaming,
+    Tools,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelDescriptor {
+    pub id: String,
+    pub route_group: String,
+    pub provider_kind: String,
+    pub upstream_model: String,
+    pub capabilities: Vec<ModelCapability>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TokenUsage {
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub total_tokens: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FinishReason {
+    Stop,
+    Length,
+    ToolCalls,
+    ContentFilter,
+    Error,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InferenceResponse {
+    pub id: String,
+    pub model: String,
+    pub output_text: String,
+    pub finish_reason: FinishReason,
+    pub usage: TokenUsage,
+    pub provider_kind: String,
+    pub created_at: DateTime<Utc>,
+}
+
+impl InferenceResponse {
+    #[must_use]
+    pub fn text(
+        model: impl Into<String>,
+        provider_kind: impl Into<String>,
+        output_text: impl Into<String>,
+    ) -> Self {
+        let output_text = output_text.into();
+        let output_tokens = output_text.split_whitespace().count() as u32;
+
+        Self {
+            id: format!("resp_{}", uuid::Uuid::new_v4().simple()),
+            model: model.into(),
+            output_text,
+            finish_reason: FinishReason::Stop,
+            usage: TokenUsage {
+                input_tokens: 16,
+                output_tokens,
+                total_tokens: 16 + output_tokens,
+            },
+            provider_kind: provider_kind.into(),
+            created_at: Utc::now(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamEventKind {
+    MessageStart,
+    ContentDelta,
+    MessageStop,
+    Done,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InferenceStreamEvent {
+    pub event: Option<String>,
+    pub kind: StreamEventKind,
+    pub delta: Option<String>,
+    pub response: Option<InferenceResponse>,
+}
+
+impl InferenceStreamEvent {
+    #[must_use]
+    pub fn delta(delta: impl Into<String>) -> Self {
+        Self {
+            event: None,
+            kind: StreamEventKind::ContentDelta,
+            delta: Some(delta.into()),
+            response: None,
+        }
+    }
+
+    #[must_use]
+    pub fn done(response: InferenceResponse) -> Self {
+        Self {
+            event: Some("message_stop".to_string()),
+            kind: StreamEventKind::Done,
+            delta: None,
+            response: Some(response),
+        }
+    }
+}
