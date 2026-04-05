@@ -205,6 +205,11 @@ impl Default for PlatformStore {
 
 impl PlatformStore {
     #[must_use]
+    pub fn empty() -> Self {
+        Self::InMemory(InMemoryPlatformStore::empty())
+    }
+
+    #[must_use]
     pub fn demo() -> Self {
         Self::InMemory(InMemoryPlatformStore::demo())
     }

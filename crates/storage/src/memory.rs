@@ -55,6 +55,28 @@ impl Default for InMemoryPlatformStore {
 
 impl InMemoryPlatformStore {
     #[must_use]
+    pub fn empty() -> Self {
+        let inner = InnerStore {
+            tenants: RwLock::new(BTreeMap::new()),
+            tenant_api_keys: RwLock::new(BTreeMap::new()),
+            tenant_api_key_lookup: RwLock::new(HashMap::new()),
+            tenant_management_tokens: RwLock::new(HashMap::new()),
+            service_accounts: RwLock::new(HashMap::new()),
+            provider_accounts: RwLock::new(BTreeMap::new()),
+            provider_credentials: RwLock::new(HashMap::new()),
+            route_groups: RwLock::new(BTreeMap::new()),
+            route_group_bindings: RwLock::new(BTreeMap::new()),
+            runtimes: RwLock::new(HashMap::new()),
+            requests: RwLock::new(Vec::new()),
+            audits: RwLock::new(Vec::new()),
+        };
+
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+
+    #[must_use]
     pub fn demo() -> Self {
         let tenant_id =
             Uuid::parse_str("00000000-0000-0000-0000-000000000001").expect("valid uuid");

@@ -235,6 +235,10 @@ impl OpenAiCodexProvider {
         )
     }
 
+    fn codex_models_client_version() -> &'static str {
+        "1.0.0"
+    }
+
     fn build_headers(
         &self,
         connection: &ProviderConnectionInfo,
@@ -311,19 +315,22 @@ impl OpenAiCodexProvider {
         &self,
         connection: &ProviderConnectionInfo,
     ) -> Result<Vec<ModelDescriptor>, ProviderError> {
-        let response = self
+        let request = self
             .client
             .get(Self::endpoint_url(&connection.api_base, "models"))
             .bearer_auth(&connection.bearer_token)
-            .headers(self.build_headers(connection)?)
-            .send()
-            .await
-            .map_err(transport_error)?;
+            .headers(self.build_headers(connection)?);
+        let request = if Self::uses_chatgpt_codex_endpoint(connection) {
+            request.query(&[("client_version", Self::codex_models_client_version())])
+        } else {
+            request
+        };
+        let response = request.send().await.map_err(transport_error)?;
         let response = ensure_success(response).await?;
         let body: ModelsApiResponse = response.json().await.map_err(transport_error)?;
 
         Ok(body
-            .data
+            .models()
             .into_iter()
             .map(|model| self.descriptor_for_model(model.id))
             .collect())
@@ -832,10 +839,23 @@ struct ChatCompletionChunk {
 struct ModelsApiResponse {
     #[serde(default)]
     data: Vec<ModelSummary>,
+    #[serde(default)]
+    models: Vec<ModelSummary>,
+}
+
+impl ModelsApiResponse {
+    fn models(self) -> Vec<ModelSummary> {
+        if self.data.is_empty() {
+            self.models
+        } else {
+            self.data
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
 struct ModelSummary {
+    #[serde(alias = "slug")]
     id: String,
 }
 
@@ -1025,27 +1045,39 @@ fn codex_input_items_for_message(message: &protocol_core::CanonicalMessage) -> V
         .collect::<Vec<_>>();
 
     let parts = OpenAiCodexProvider::message_parts(message);
-    if message.tool_calls.is_empty() || !parts.is_empty() {
+    let content = parts
+        .iter()
+        .filter_map(|part| codex_content_part_value(part, &message.role))
+        .collect::<Vec<_>>();
+    if message.tool_calls.is_empty() || !content.is_empty() {
         items.push(json!({
             "type": "message",
             "role": role_label(&message.role),
-            "content": parts.iter().map(codex_content_part_value).collect::<Vec<_>>()
+            "content": content
         }));
     }
 
     items
 }
 
-fn codex_content_part_value(part: &ContentPart) -> Value {
-    match part {
-        ContentPart::Text { text } => json!({
+fn codex_content_part_value(
+    part: &ContentPart,
+    role: &protocol_core::MessageRole,
+) -> Option<Value> {
+    match (role, part) {
+        (protocol_core::MessageRole::Assistant, ContentPart::Text { text }) => Some(json!({
+            "type": "output_text",
+            "text": text,
+        })),
+        (protocol_core::MessageRole::Assistant, ContentPart::ImageUrl { .. }) => None,
+        (_, ContentPart::Text { text }) => Some(json!({
             "type": "input_text",
             "text": text,
-        }),
-        ContentPart::ImageUrl { image_url } => json!({
+        })),
+        (_, ContentPart::ImageUrl { image_url }) => Some(json!({
             "type": "input_image",
             "image_url": image_url,
-        }),
+        })),
     }
 }
 
@@ -1568,12 +1600,13 @@ mod tests {
                 .and_then(|value| value.to_str().ok())
                 .unwrap_or_default()
                 .to_string();
+            let query = request.uri().query().unwrap_or_default().to_string();
 
             assert_eq!(auth, "Bearer test-token");
+            assert_eq!(query, "client_version=1.0.0");
 
             axum::Json(json!({
-                "object": "list",
-                "data": [
+                "models": [
                     { "id": "gpt-5-codex" },
                     { "id": "gpt-5-codex-mini" }
                 ]
@@ -1923,6 +1956,78 @@ mod tests {
         addr
     }
 
+    async fn spawn_codex_assistant_history_server() -> SocketAddr {
+        async fn codex_responses_handler(request: Request) -> impl IntoResponse {
+            let auth = request
+                .headers()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            let body = axum::body::to_bytes(request.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            let body: Value = serde_json::from_slice(&body).expect("json body");
+
+            assert_eq!(auth, "Bearer test-token");
+            assert_eq!(
+                body.pointer("/input/0/role").and_then(Value::as_str),
+                Some("user")
+            );
+            assert_eq!(
+                body.pointer("/input/0/content/0/type")
+                    .and_then(Value::as_str),
+                Some("input_text")
+            );
+            assert_eq!(
+                body.pointer("/input/1/role").and_then(Value::as_str),
+                Some("assistant")
+            );
+            assert_eq!(
+                body.pointer("/input/1/content/0/type")
+                    .and_then(Value::as_str),
+                Some("output_text")
+            );
+            assert_eq!(
+                body.pointer("/input/1/content/0/text")
+                    .and_then(Value::as_str),
+                Some("第一轮回答")
+            );
+            assert_eq!(
+                body.pointer("/input/2/role").and_then(Value::as_str),
+                Some("user")
+            );
+            assert_eq!(
+                body.pointer("/input/2/content/0/type")
+                    .and_then(Value::as_str),
+                Some("input_text")
+            );
+
+            let payload = concat!(
+                "event: response.completed\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_history_123\",\"model\":\"gpt-5.1-codex\",\"output\":[{\"id\":\"msg_history_123\",\"type\":\"message\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"annotations\":[],\"text\":\"第二轮回答\"}],\"role\":\"assistant\"}],\"usage\":{\"input_tokens\":11,\"output_tokens\":3,\"total_tokens\":14}}}\n\n"
+            );
+
+            ([(http::header::CONTENT_TYPE, "text/event-stream")], payload).into_response()
+        }
+
+        let app = Router::new()
+            .route(
+                "/backend-api/codex/responses",
+                post(codex_responses_handler),
+            )
+            .fallback(|| async { (HttpStatusCode::NOT_FOUND, Body::empty()) });
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+        addr
+    }
+
     async fn setup_provider(
         api_base: &str,
     ) -> (
@@ -2176,6 +2281,49 @@ mod tests {
         assert_eq!(response.finish_reason, FinishReason::Stop);
         assert_eq!(response.output_text, "Shanghai is 25C.");
         assert!(response.tool_calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn chat_on_codex_endpoint_encodes_assistant_history_as_output_text() {
+        let addr = spawn_codex_assistant_history_server().await;
+        let (provider, mut request, _) =
+            setup_provider(&format!("http://{addr}/backend-api/codex")).await;
+        request.public_model = "gpt-5-codex".to_string();
+        request.upstream_model = Some("gpt-5-codex".to_string());
+        request.messages = vec![
+            protocol_core::CanonicalMessage {
+                role: protocol_core::MessageRole::User,
+                content: "第一轮提问".to_string(),
+                parts: vec![protocol_core::ContentPart::Text {
+                    text: "第一轮提问".to_string(),
+                }],
+                tool_calls: vec![],
+                tool_call_id: None,
+            },
+            protocol_core::CanonicalMessage {
+                role: protocol_core::MessageRole::Assistant,
+                content: "第一轮回答".to_string(),
+                parts: vec![protocol_core::ContentPart::Text {
+                    text: "第一轮回答".to_string(),
+                }],
+                tool_calls: vec![],
+                tool_call_id: None,
+            },
+            protocol_core::CanonicalMessage {
+                role: protocol_core::MessageRole::User,
+                content: "继续问第二轮".to_string(),
+                parts: vec![protocol_core::ContentPart::Text {
+                    text: "继续问第二轮".to_string(),
+                }],
+                tool_calls: vec![],
+                tool_call_id: None,
+            },
+        ];
+
+        let response = provider.chat(request).await.expect("chat");
+
+        assert_eq!(response.model, "gpt-5.1-codex");
+        assert_eq!(response.output_text, "第二轮回答");
     }
 
     #[tokio::test]

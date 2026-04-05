@@ -629,7 +629,7 @@ fn openai_content_parts(content: &OpenAiMessageContent) -> Vec<ContentPart> {
         OpenAiMessageContent::Parts(parts) => parts
             .iter()
             .filter_map(|part| match part.part_type.as_str() {
-                "text" | "input_text" => part
+                "text" | "input_text" | "output_text" => part
                     .text
                     .as_ref()
                     .map(|text| ContentPart::Text { text: text.clone() }),
@@ -736,7 +736,7 @@ fn parse_responses_input_item(item: Value) -> Option<CanonicalMessage> {
                 Value::Array(parts) => parts
                     .iter()
                     .filter_map(|part| match part.get("type").and_then(Value::as_str) {
-                        Some("input_text") | Some("text") => part
+                        Some("input_text") | Some("text") | Some("output_text") => part
                             .get("text")
                             .and_then(Value::as_str)
                             .map(|text| ContentPart::Text {
@@ -1596,6 +1596,78 @@ mod tests {
             let payload = concat!(
                 "event: response.completed\n",
                 "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_tool_result_123\",\"model\":\"gpt-5.1-codex\",\"output\":[{\"id\":\"msg_tool_result_123\",\"type\":\"message\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"annotations\":[],\"text\":\"Shanghai is 25C.\"}],\"role\":\"assistant\"}],\"usage\":{\"input_tokens\":14,\"output_tokens\":4,\"total_tokens\":18}}}\n\n"
+            );
+
+            ([(http::header::CONTENT_TYPE, "text/event-stream")], payload).into_response()
+        }
+
+        let app = Router::new()
+            .route(
+                "/backend-api/codex/responses",
+                post(codex_responses_handler),
+            )
+            .fallback(|| async { (StatusCode::NOT_FOUND, Body::empty()) });
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+        addr
+    }
+
+    async fn spawn_codex_assistant_history_server() -> SocketAddr {
+        async fn codex_responses_handler(request: AxumRequest) -> impl IntoResponse {
+            let auth = request
+                .headers()
+                .get(http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            let body = to_bytes(request.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            let body: Value = serde_json::from_slice(&body).expect("json body");
+
+            assert_eq!(auth, "Bearer gateway-codex-token");
+            assert_eq!(
+                body.pointer("/input/0/role").and_then(Value::as_str),
+                Some("user")
+            );
+            assert_eq!(
+                body.pointer("/input/0/content/0/type")
+                    .and_then(Value::as_str),
+                Some("input_text")
+            );
+            assert_eq!(
+                body.pointer("/input/1/role").and_then(Value::as_str),
+                Some("assistant")
+            );
+            assert_eq!(
+                body.pointer("/input/1/content/0/type")
+                    .and_then(Value::as_str),
+                Some("output_text")
+            );
+            assert_eq!(
+                body.pointer("/input/1/content/0/text")
+                    .and_then(Value::as_str),
+                Some("第一轮回答")
+            );
+            assert_eq!(
+                body.pointer("/input/2/role").and_then(Value::as_str),
+                Some("user")
+            );
+            assert_eq!(
+                body.pointer("/input/2/content/0/type")
+                    .and_then(Value::as_str),
+                Some("input_text")
+            );
+
+            let payload = concat!(
+                "event: response.completed\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_history_123\",\"model\":\"gpt-5.1-codex\",\"output\":[{\"id\":\"msg_history_123\",\"type\":\"message\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"annotations\":[],\"text\":\"第二轮回答\"}],\"role\":\"assistant\"}],\"usage\":{\"input_tokens\":11,\"output_tokens\":3,\"total_tokens\":14}}}\n\n"
             );
 
             ([(http::header::CONTENT_TYPE, "text/event-stream")], payload).into_response()
@@ -2849,6 +2921,51 @@ mod tests {
         assert_eq!(record.provider_kind, "openai_codex");
         assert_eq!(record.status_code, 200);
         assert_eq!(record.usage.total_tokens, 8);
+    }
+
+    #[tokio::test]
+    async fn chat_completions_supports_assistant_history_on_second_turn() {
+        let addr = spawn_codex_assistant_history_server().await;
+        let state = state_with_codex_route(&format!("http://{addr}/backend-api/codex")).await;
+        let app = app(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/v1/chat/completions")
+                    .header(http::header::AUTHORIZATION, "Bearer fgk_demo_gateway_key")
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "gpt-5-codex",
+                            "messages": [
+                                { "role": "user", "content": "第一轮提问" },
+                                { "role": "assistant", "content": "第一轮回答" },
+                                { "role": "user", "content": "继续问第二轮" }
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(
+            body.pointer("/choices/0/message/content")
+                .and_then(Value::as_str),
+            Some("第二轮回答")
+        );
+        assert_eq!(
+            body.get("model").and_then(Value::as_str),
+            Some("gpt-5.1-codex")
+        );
     }
 
     #[tokio::test]
