@@ -369,9 +369,12 @@ name = "control-plane"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
+ "chrono",
  "http",
  "observability",
+ "protocol-core",
  "provider-core",
  "provider-openai-codex",
  "scheduler",
@@ -1857,6 +1860,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "axum",
+ "base64",
  "chrono",
  "futures",
  "http",

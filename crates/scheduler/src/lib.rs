@@ -20,6 +20,7 @@ pub struct AccountRuntime {
     pub health_score: u8,
     pub cooldown_until: Option<DateTime<Utc>>,
     pub circuit_open_until: Option<DateTime<Utc>>,
+    pub consecutive_failures: u32,
     pub in_flight: u32,
     pub max_in_flight: u32,
     pub last_used_at: Option<DateTime<Utc>>,
@@ -33,6 +34,7 @@ impl AccountRuntime {
             health_score: 100,
             cooldown_until: None,
             circuit_open_until: None,
+            consecutive_failures: 0,
             in_flight: 0,
             max_in_flight,
             last_used_at: None,
@@ -52,6 +54,9 @@ impl AccountRuntime {
             ProviderOutcome::Success => {
                 self.state = AccountState::Active;
                 self.health_score = self.health_score.saturating_add(2);
+                self.cooldown_until = None;
+                self.circuit_open_until = None;
+                self.consecutive_failures = 0;
                 self.last_used_at = Some(now);
             }
             ProviderOutcome::RateLimited {
@@ -60,18 +65,30 @@ impl AccountRuntime {
                 self.state = AccountState::Cooling;
                 let retry_after = retry_after_seconds.unwrap_or(30).clamp(1, 600);
                 self.cooldown_until = Some(now + TimeDelta::seconds(retry_after));
+                self.circuit_open_until = None;
+                self.consecutive_failures = self.consecutive_failures.saturating_add(1);
                 self.health_score = self.health_score.saturating_sub(10);
             }
             ProviderOutcome::UpstreamFailure | ProviderOutcome::TransportFailure => {
+                self.state = AccountState::Cooling;
+                self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+                let backoff_minutes = match self.consecutive_failures {
+                    0 | 1 => 15,
+                    2 => 30,
+                    _ => 60,
+                };
+                self.cooldown_until = Some(now + TimeDelta::minutes(backoff_minutes));
                 self.circuit_open_until = Some(now + TimeDelta::seconds(10));
                 self.health_score = self.health_score.saturating_sub(15);
             }
             ProviderOutcome::InvalidCredentials => {
                 self.state = AccountState::InvalidCredentials;
+                self.consecutive_failures = self.consecutive_failures.saturating_add(1);
                 self.health_score = 0;
             }
             ProviderOutcome::QuotaExhausted => {
                 self.state = AccountState::QuotaExhausted;
+                self.consecutive_failures = self.consecutive_failures.saturating_add(1);
                 self.health_score = self.health_score.saturating_sub(25);
             }
         }
@@ -178,5 +195,62 @@ mod tests {
         let expected_id = second.account_id;
         let selected = select_candidate(now, &[first, second]).expect("candidate");
         assert_eq!(selected.account_id, expected_id);
+    }
+
+    #[test]
+    fn repeated_transport_failures_escalate_probe_backoff_to_fifteen_thirty_and_sixty_minutes() {
+        let now = Utc::now();
+        let mut runtime = AccountRuntime::new(AccountState::Active, 8);
+
+        runtime.apply_outcome(ProviderOutcome::TransportFailure, now);
+        assert_eq!(runtime.state, AccountState::Cooling);
+        assert_eq!(
+            runtime.cooldown_until,
+            Some(now + TimeDelta::minutes(15)),
+            "first scheduled probe failure should wait 15 minutes",
+        );
+
+        runtime.apply_outcome(ProviderOutcome::TransportFailure, now);
+        assert_eq!(
+            runtime.cooldown_until,
+            Some(now + TimeDelta::minutes(30)),
+            "second consecutive failure should wait 30 minutes",
+        );
+
+        runtime.apply_outcome(ProviderOutcome::TransportFailure, now);
+        assert_eq!(
+            runtime.cooldown_until,
+            Some(now + TimeDelta::minutes(60)),
+            "third consecutive failure should wait 60 minutes",
+        );
+    }
+
+    #[test]
+    fn successful_probe_clears_cooldown_and_circuit_before_reentering_scheduler() {
+        let now = Utc::now();
+        let mut runtime = AccountRuntime {
+            state: AccountState::Cooling,
+            health_score: 40,
+            cooldown_until: Some(now + TimeDelta::minutes(15)),
+            circuit_open_until: Some(now + TimeDelta::minutes(15)),
+            consecutive_failures: 2,
+            in_flight: 0,
+            max_in_flight: 8,
+            last_used_at: None,
+        };
+
+        let recovered_at = now + TimeDelta::minutes(16);
+        runtime.apply_outcome(ProviderOutcome::Success, recovered_at);
+
+        assert_eq!(runtime.state, AccountState::Active);
+        assert!(
+            runtime.cooldown_until.is_none(),
+            "a successful scheduled probe should clear cooldown"
+        );
+        assert!(
+            runtime.circuit_open_until.is_none(),
+            "a successful scheduled probe should clear circuit state"
+        );
+        assert!(runtime.is_schedulable(recovered_at));
     }
 }

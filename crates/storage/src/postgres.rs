@@ -1,15 +1,16 @@
 use crate::{
-    AuditEvent, AuthError, CreatedApiKey, GatewayAuthContext, Permission, ProviderAccountCandidate,
-    ProviderAccountRecord, RequestRecord, Role, RouteGroupBindingRecord, RouteGroupRecord,
-    ScopeTarget, ServiceAccountPrincipal, StoreError, Tenant, TenantApiKeyStatus, TenantApiKeyView,
-    TenantManagementPrincipal, UsageSummary, provider_connection_from_parts, role_allows,
-    scope_allows,
+    AccountInspectionRecord, AccountInspectionStatus, AuditEvent, AuthError, CreatedApiKey,
+    GatewayAuthContext, Permission, ProbeDispatchLease, ProviderAccountCandidate,
+    ProviderAccountRecord, RefreshDispatchLease, RequestRecord, Role, RouteGroupBindingRecord,
+    RouteGroupRecord, ScopeTarget, ServiceAccountPrincipal, StoreError, Tenant, TenantApiKeyStatus,
+    TenantApiKeyView, TenantManagementPrincipal, UsageSummary, provider_connection_from_parts,
+    role_allows, scope_allows,
 };
 use aes_gcm::{
     Aes256Gcm, Nonce,
     aead::{Aead, KeyInit},
 };
-use chrono::Utc;
+use chrono::{TimeDelta, Utc};
 use protocol_core::{ModelCapability, ModelDescriptor, TokenUsage};
 use provider_core::{
     AccountCapabilities, ProviderAccountEnvelope, ProviderConnectionInfo, ValidatedProviderAccount,
@@ -209,8 +210,8 @@ impl PostgresPlatformStore {
 
         sqlx::query(
             "insert into account_runtime
-             (provider_account_id, state, health_score, in_flight, max_in_flight)
-             values ($1, 'active', 100, 0, 16)",
+             (provider_account_id, state, health_score, consecutive_failures, in_flight, max_in_flight)
+             values ($1, 'active', 100, 0, 0, 16)",
         )
         .bind(provider_account_id)
         .execute(&self.pool)
@@ -639,6 +640,131 @@ impl PostgresPlatformStore {
             .collect()
     }
 
+    pub async fn provider_account(
+        &self,
+        account_id: Uuid,
+    ) -> Result<Option<ProviderAccountRecord>, StoreError> {
+        let row = sqlx::query(
+            "select id, provider, credential_kind, payload_version, state, external_account_id,
+                    redacted_display, plan_type, metadata, labels, tags, capabilities, expires_at,
+                    last_validated_at, created_at
+             from provider_accounts
+             where id = $1",
+        )
+        .bind(account_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(store_backend_error)?;
+        row.map(|row| provider_account_from_row(&row)).transpose()
+    }
+
+    pub async fn record_account_inspection(
+        &self,
+        provider_account_id: Uuid,
+        actor: String,
+        status: AccountInspectionStatus,
+        error_kind: Option<String>,
+        error_code: Option<String>,
+        error_message: Option<String>,
+    ) -> Result<AccountInspectionRecord, StoreError> {
+        let record = AccountInspectionRecord {
+            id: Uuid::new_v4(),
+            provider_account_id,
+            actor,
+            status,
+            error_kind,
+            error_code,
+            error_message,
+            inspected_at: Utc::now(),
+        };
+
+        sqlx::query(
+            "insert into account_inspections
+             (id, provider_account_id, actor, status, error_kind, error_code, error_message, inspected_at)
+             values ($1, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(record.id)
+        .bind(record.provider_account_id)
+        .bind(&record.actor)
+        .bind(account_inspection_status_to_db(&record.status))
+        .bind(&record.error_kind)
+        .bind(&record.error_code)
+        .bind(&record.error_message)
+        .bind(record.inspected_at)
+        .execute(&self.pool)
+        .await
+        .map_err(store_backend_error)?;
+
+        Ok(record)
+    }
+
+    pub async fn list_account_inspections(
+        &self,
+        provider_account_id: Uuid,
+    ) -> Result<Vec<AccountInspectionRecord>, StoreError> {
+        let rows = sqlx::query(
+            "select id, provider_account_id, actor, status, error_kind, error_code, error_message, inspected_at
+             from account_inspections
+             where provider_account_id = $1
+             order by inspected_at desc, id desc",
+        )
+        .bind(provider_account_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(store_backend_error)?;
+        rows.into_iter()
+            .map(|row| account_inspection_from_row(&row))
+            .collect()
+    }
+
+    pub async fn provider_account_envelope(
+        &self,
+        account_id: Uuid,
+    ) -> Result<Option<ProviderAccountEnvelope>, StoreError> {
+        let row = sqlx::query(
+            "select p.provider, p.credential_kind, p.payload_version, p.metadata, p.labels, p.tags, s.cipher_text
+             from provider_accounts p
+             join lateral (
+                select cipher_text
+                from provider_account_secret_versions
+                where provider_account_id = p.id
+                order by created_at desc
+                limit 1
+             ) s on true
+             where p.id = $1
+             limit 1",
+        )
+        .bind(account_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(store_backend_error)?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let Json(labels): Json<Vec<String>> = row.try_get("labels").map_err(store_backend_error)?;
+        let Json(tags): Json<BTreeMap<String, String>> =
+            row.try_get("tags").map_err(store_backend_error)?;
+        let metadata: Value = row.try_get("metadata").map_err(store_backend_error)?;
+        let cipher_text: Vec<u8> = row.try_get("cipher_text").map_err(store_backend_error)?;
+        let credentials = self.decrypt_json(&cipher_text)?;
+
+        Ok(Some(ProviderAccountEnvelope {
+            provider: row.try_get("provider").map_err(store_backend_error)?,
+            credential_kind: row
+                .try_get("credential_kind")
+                .map_err(store_backend_error)?,
+            payload_version: row
+                .try_get("payload_version")
+                .map_err(store_backend_error)?,
+            credentials,
+            metadata,
+            labels,
+            tags,
+        }))
+    }
+
     pub async fn ingest_provider_account(
         &self,
         envelope: ProviderAccountEnvelope,
@@ -711,8 +837,8 @@ impl PostgresPlatformStore {
 
         sqlx::query(
             "insert into account_runtime
-             (provider_account_id, state, health_score, in_flight, max_in_flight)
-             values ($1, 'active', 100, 0, 16)",
+             (provider_account_id, state, health_score, consecutive_failures, in_flight, max_in_flight)
+             values ($1, 'active', 100, 0, 0, 16)",
         )
         .bind(record.id)
         .execute(&self.pool)
@@ -720,6 +846,116 @@ impl PostgresPlatformStore {
         .map_err(store_backend_error)?;
 
         Ok(record)
+    }
+
+    pub async fn revalidate_provider_account(
+        &self,
+        account_id: Uuid,
+        validated: ValidatedProviderAccount,
+        capabilities: AccountCapabilities,
+    ) -> Result<Option<ProviderAccountRecord>, StoreError> {
+        let now = Utc::now();
+        let capability_ids = capabilities
+            .models
+            .iter()
+            .map(|model| model.id.clone())
+            .collect::<Vec<_>>();
+
+        let row = sqlx::query(
+            "update provider_accounts
+             set state = 'active',
+                 external_account_id = $1,
+                 redacted_display = $2,
+                 capabilities = $3,
+                 expires_at = $4,
+                 last_validated_at = $5
+             where id = $6
+             returning id, provider, credential_kind, payload_version, state, external_account_id,
+                       redacted_display, plan_type, metadata, labels, tags, capabilities, expires_at,
+                       last_validated_at, created_at",
+        )
+        .bind(validated.provider_account_id)
+        .bind(validated.redacted_display)
+        .bind(Json(capability_ids))
+        .bind(validated.expires_at)
+        .bind(now)
+        .bind(account_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(store_backend_error)?;
+
+        if row.is_none() {
+            return Ok(None);
+        }
+
+        sqlx::query(
+            "update account_runtime
+             set state = 'active', cooldown_until = null, circuit_open_until = null,
+                 consecutive_failures = 0
+             where provider_account_id = $1",
+        )
+        .bind(account_id)
+        .execute(&self.pool)
+        .await
+        .map_err(store_backend_error)?;
+
+        row.map(|row| provider_account_from_row(&row)).transpose()
+    }
+
+    pub async fn rotate_provider_account_secret(
+        &self,
+        account_id: Uuid,
+        credentials: Value,
+        expires_at: Option<chrono::DateTime<Utc>>,
+    ) -> Result<Option<ProviderAccountRecord>, StoreError> {
+        let now = Utc::now();
+        let row = sqlx::query(
+            "update provider_accounts
+             set state = 'active', expires_at = $1, last_validated_at = $2
+             where id = $3
+             returning id, provider, credential_kind, payload_version, state, external_account_id,
+                       redacted_display, plan_type, metadata, labels, tags, capabilities, expires_at,
+                       last_validated_at, created_at",
+        )
+        .bind(expires_at)
+        .bind(now)
+        .bind(account_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(store_backend_error)?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let record = provider_account_from_row(&row)?;
+
+        sqlx::query(
+            "insert into provider_account_secret_versions
+             (id, provider_account_id, cipher_text, key_version, created_at)
+             values ($1, $2, $3, $4, $5)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(account_id)
+        .bind(self.encrypt_json(&credentials)?)
+        .bind(record.payload_version.clone())
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(store_backend_error)?;
+
+        sqlx::query(
+            "update account_runtime
+             set state = 'active', cooldown_until = null, circuit_open_until = null,
+                 consecutive_failures = 0
+             where provider_account_id = $1",
+        )
+        .bind(account_id)
+        .execute(&self.pool)
+        .await
+        .map_err(store_backend_error)?;
+
+        Ok(Some(record))
     }
 
     pub async fn set_provider_account_state(
@@ -876,7 +1112,8 @@ impl PostgresPlatformStore {
     ) -> Result<Vec<ProviderAccountCandidate>, StoreError> {
         let rows = sqlx::query(
             "select b.provider_account_id, b.route_group_id, b.weight, r.state, r.health_score, r.cooldown_until,
-                    r.circuit_open_until, r.in_flight, r.max_in_flight, r.last_used_at, p.provider
+                    r.circuit_open_until, r.consecutive_failures, r.in_flight, r.max_in_flight,
+                    r.last_used_at, p.provider
              from route_groups rg
              join route_group_bindings b on b.route_group_id = rg.id
              join account_runtime r on r.provider_account_id = b.provider_account_id
@@ -898,7 +1135,8 @@ impl PostgresPlatformStore {
         outcome: ProviderOutcome,
     ) -> Result<(), StoreError> {
         let row = sqlx::query(
-            "select state, health_score, cooldown_until, circuit_open_until, in_flight, max_in_flight, last_used_at
+            "select state, health_score, cooldown_until, circuit_open_until, consecutive_failures,
+                    in_flight, max_in_flight, last_used_at
              from account_runtime where provider_account_id = $1",
         )
         .bind(account_id)
@@ -915,13 +1153,14 @@ impl PostgresPlatformStore {
         sqlx::query(
             "update account_runtime
              set state = $1, health_score = $2, cooldown_until = $3, circuit_open_until = $4,
-                 in_flight = $5, max_in_flight = $6, last_used_at = $7
-             where provider_account_id = $8",
+                 consecutive_failures = $5, in_flight = $6, max_in_flight = $7, last_used_at = $8
+             where provider_account_id = $9",
         )
         .bind(account_state_to_db(&runtime.state))
         .bind(i32::from(runtime.health_score))
         .bind(runtime.cooldown_until)
         .bind(runtime.circuit_open_until)
+        .bind(runtime.consecutive_failures as i32)
         .bind(runtime.in_flight as i32)
         .bind(runtime.max_in_flight as i32)
         .bind(runtime.last_used_at)
@@ -951,6 +1190,139 @@ impl PostgresPlatformStore {
         Ok(candidates
             .into_iter()
             .find(|candidate| candidate.account_id == selected.account_id))
+    }
+
+    pub async fn dispatch_due_provider_account_probes(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ProbeDispatchLease>, StoreError> {
+        let now = Utc::now();
+        let lease_until = now + TimeDelta::minutes(5);
+        let rows = sqlx::query(
+            "select p.id
+             from provider_accounts p
+             left join account_probe_leases l
+               on l.provider_account_id = p.id
+              and l.leased_until > $1
+             where p.state in ('active', 'cooling', 'quota_exhausted')
+               and l.provider_account_id is null
+               and coalesce(p.last_validated_at, p.created_at) <= $1
+             order by coalesce(p.last_validated_at, p.created_at), p.created_at, p.id
+             limit $2",
+        )
+        .bind(now)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(store_backend_error)?;
+
+        let mut leases = Vec::with_capacity(rows.len());
+        for row in rows {
+            let account_id: Uuid = row.try_get("id").map_err(store_backend_error)?;
+            let lease = ProbeDispatchLease {
+                lease_id: Uuid::new_v4(),
+                account_id,
+                leased_at: now,
+                leased_until: lease_until,
+            };
+            let result = sqlx::query(
+                "insert into account_probe_leases (provider_account_id, lease_id, leased_at, leased_until)
+                 values ($1, $2, $3, $4)
+                 on conflict (provider_account_id) do update
+                 set lease_id = excluded.lease_id,
+                     leased_at = excluded.leased_at,
+                     leased_until = excluded.leased_until
+                 where account_probe_leases.leased_until <= excluded.leased_at",
+            )
+            .bind(lease.account_id)
+            .bind(lease.lease_id)
+            .bind(lease.leased_at)
+            .bind(lease.leased_until)
+            .execute(&self.pool)
+            .await
+            .map_err(store_backend_error)?;
+
+            if result.rows_affected() > 0 {
+                leases.push(lease);
+            }
+        }
+
+        Ok(leases)
+    }
+
+    pub async fn dispatch_due_provider_account_refreshes(
+        &self,
+        limit: usize,
+        refresh_before_seconds: i64,
+    ) -> Result<Vec<RefreshDispatchLease>, StoreError> {
+        let now = Utc::now();
+        let refresh_before =
+            TimeDelta::try_seconds(refresh_before_seconds.max(0)).unwrap_or_else(TimeDelta::zero);
+        let due_before = now + refresh_before;
+        let lease_until = now + TimeDelta::minutes(5);
+        let candidate_ids = sqlx::query(
+            "select p.id
+             from provider_accounts p
+             left join account_refresh_leases l
+               on l.provider_account_id = p.id
+              and l.leased_until > $1
+             where p.state in ('active', 'cooling', 'quota_exhausted')
+               and p.credential_kind = 'oauth_tokens'
+               and p.expires_at is not null
+               and p.expires_at <= $2
+               and l.provider_account_id is null
+             order by p.expires_at, coalesce(p.last_validated_at, p.created_at), p.created_at, p.id
+             limit $3",
+        )
+        .bind(now)
+        .bind(due_before)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(store_backend_error)?;
+
+        let mut leases = Vec::with_capacity(candidate_ids.len());
+        for row in candidate_ids {
+            let account_id: Uuid = row.try_get("id").map_err(store_backend_error)?;
+            let envelope = self.provider_account_envelope(account_id).await?;
+            let has_refresh_token = envelope
+                .as_ref()
+                .and_then(|value| value.credentials.get("refresh_token"))
+                .and_then(Value::as_str)
+                .is_some();
+            if !has_refresh_token {
+                continue;
+            }
+
+            let lease = RefreshDispatchLease {
+                lease_id: Uuid::new_v4(),
+                account_id,
+                leased_at: now,
+                leased_until: lease_until,
+            };
+            let result = sqlx::query(
+                "insert into account_refresh_leases (provider_account_id, lease_id, leased_at, leased_until)
+                 values ($1, $2, $3, $4)
+                 on conflict (provider_account_id) do update
+                 set lease_id = excluded.lease_id,
+                     leased_at = excluded.leased_at,
+                     leased_until = excluded.leased_until
+                 where account_refresh_leases.leased_until <= excluded.leased_at",
+            )
+            .bind(lease.account_id)
+            .bind(lease.lease_id)
+            .bind(lease.leased_at)
+            .bind(lease.leased_until)
+            .execute(&self.pool)
+            .await
+            .map_err(store_backend_error)?;
+
+            if result.rows_affected() > 0 {
+                leases.push(lease);
+            }
+        }
+
+        Ok(leases)
     }
 
     pub async fn resolve_provider_connection(
@@ -1185,6 +1557,25 @@ fn route_group_from_row(row: &PgRow) -> Result<RouteGroupRecord, StoreError> {
     })
 }
 
+fn account_inspection_from_row(row: &PgRow) -> Result<AccountInspectionRecord, StoreError> {
+    Ok(AccountInspectionRecord {
+        id: row.try_get("id").map_err(store_backend_error)?,
+        provider_account_id: row
+            .try_get("provider_account_id")
+            .map_err(store_backend_error)?,
+        actor: row.try_get("actor").map_err(store_backend_error)?,
+        status: account_inspection_status_from_db(
+            row.try_get::<String, _>("status")
+                .map_err(store_backend_error)?
+                .as_str(),
+        )?,
+        error_kind: row.try_get("error_kind").map_err(store_backend_error)?,
+        error_code: row.try_get("error_code").map_err(store_backend_error)?,
+        error_message: row.try_get("error_message").map_err(store_backend_error)?,
+        inspected_at: row.try_get("inspected_at").map_err(store_backend_error)?,
+    })
+}
+
 fn candidate_from_row(row: &PgRow) -> Result<ProviderAccountCandidate, StoreError> {
     Ok(ProviderAccountCandidate {
         account_id: row
@@ -1213,6 +1604,9 @@ fn account_runtime_from_row(row: &PgRow) -> Result<AccountRuntime, StoreError> {
         circuit_open_until: row
             .try_get("circuit_open_until")
             .map_err(store_backend_error)?,
+        consecutive_failures: row
+            .try_get::<i32, _>("consecutive_failures")
+            .map_err(store_backend_error)? as u32,
         in_flight: row
             .try_get::<i32, _>("in_flight")
             .map_err(store_backend_error)? as u32,
@@ -1246,6 +1640,23 @@ fn account_state_from_db(value: &str) -> Result<AccountState, StoreError> {
         "disabled" => Ok(AccountState::Disabled),
         other => Err(StoreError::Backend(format!(
             "unknown account state: {other}"
+        ))),
+    }
+}
+
+fn account_inspection_status_to_db(status: &AccountInspectionStatus) -> &'static str {
+    match status {
+        AccountInspectionStatus::Healthy => "healthy",
+        AccountInspectionStatus::Unhealthy => "unhealthy",
+    }
+}
+
+fn account_inspection_status_from_db(value: &str) -> Result<AccountInspectionStatus, StoreError> {
+    match value {
+        "healthy" => Ok(AccountInspectionStatus::Healthy),
+        "unhealthy" => Ok(AccountInspectionStatus::Unhealthy),
+        other => Err(StoreError::Backend(format!(
+            "unknown account inspection status: {other}"
         ))),
     }
 }

@@ -9,6 +9,7 @@ version.workspace = true
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+chrono.workspace = true
 http.workspace = true
 observability = { path = "../../crates/observability" }
 provider-core = { path = "../../crates/provider-core" }
@@ -22,3 +23,7 @@ tower.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+protocol-core = { path = "../../crates/protocol-core" }

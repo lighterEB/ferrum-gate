@@ -26,6 +26,7 @@ anyhow = "1.0"
 async-stream = "0.3"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["macros"] }
+base64 = "0.22"
 chrono = { version = "0.4", features = ["clock", "serde"] }
 futures = "0.3"
 hex = "0.4"
@@ -40,7 +41,7 @@ tempfile = "3"
 thiserror = "2.0"
 tokio = { version = "1.48", features = ["full"] }
 tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.6", features = ["trace"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 uuid = { version = "1.18", features = ["serde", "v4", "v5"] }

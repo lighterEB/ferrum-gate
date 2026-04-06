@@ -45,6 +45,12 @@ pub struct QuotaSnapshot {
     pub checked_at: DateTime<Utc>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RefreshedProviderCredentials {
+    pub credentials: Value,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct ProviderConnectionInfo {
     pub account_id: Uuid,
@@ -140,6 +146,17 @@ pub trait ProviderAdapter: Send + Sync {
         &self,
         account: &ValidatedProviderAccount,
     ) -> Result<QuotaSnapshot, ProviderError>;
+
+    async fn refresh_credentials(
+        &self,
+        _envelope: &ProviderAccountEnvelope,
+    ) -> Result<RefreshedProviderCredentials, ProviderError> {
+        Err(ProviderError::new(
+            ProviderErrorKind::Unsupported,
+            501,
+            "provider refresh not implemented",
+        ))
+    }
 
     async fn chat(&self, request: InferenceRequest) -> Result<InferenceResponse, ProviderError>;
 

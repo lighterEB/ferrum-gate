@@ -1,6 +1,10 @@
 use async_stream::stream;
 use async_trait::async_trait;
-use chrono::Utc;
+use base64::{
+    Engine as _,
+    engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD},
+};
+use chrono::{DateTime, TimeDelta, Utc};
 use futures::StreamExt;
 use protocol_core::{
     ContentPart, FinishReason, InferenceRequest, InferenceResponse, InferenceStreamEvent,
@@ -9,11 +13,11 @@ use protocol_core::{
 use provider_core::{
     AccountCapabilities, ProviderAccountEnvelope, ProviderAdapter, ProviderConnectionInfo,
     ProviderCredentialResolver, ProviderError, ProviderErrorKind, ProviderStream, QuotaSnapshot,
-    ValidatedProviderAccount,
+    RefreshedProviderCredentials, ValidatedProviderAccount,
 };
 use reqwest::{
     Client, Response, StatusCode,
-    header::{HeaderMap, HeaderName, HeaderValue},
+    header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -78,6 +82,96 @@ impl OpenAiCodexProvider {
 
     fn default_api_base() -> &'static str {
         "https://api.openai.com/v1"
+    }
+
+    fn default_token_endpoint() -> &'static str {
+        "https://auth.openai.com/oauth/token"
+    }
+
+    fn string_field<'a>(envelope: &'a ProviderAccountEnvelope, key: &str) -> Option<&'a str> {
+        envelope
+            .credentials
+            .get(key)
+            .and_then(Value::as_str)
+            .or_else(|| envelope.metadata.get(key).and_then(Value::as_str))
+    }
+
+    fn refresh_token_endpoint(envelope: &ProviderAccountEnvelope) -> String {
+        Self::string_field(envelope, "token_endpoint")
+            .or_else(|| Self::string_field(envelope, "oauth_token_endpoint"))
+            .unwrap_or(Self::default_token_endpoint())
+            .trim_end_matches('/')
+            .to_string()
+    }
+
+    fn refresh_client_id(envelope: &ProviderAccountEnvelope) -> Result<String, ProviderError> {
+        Self::string_field(envelope, "client_id")
+            .or_else(|| Self::string_field(envelope, "oauth_client_id"))
+            .map(ToString::to_string)
+            .or_else(|| {
+                ["access_token", "id_token"].into_iter().find_map(|field| {
+                    envelope
+                        .credentials
+                        .get(field)
+                        .and_then(Value::as_str)
+                        .and_then(Self::jwt_client_id)
+                })
+            })
+            .ok_or_else(|| {
+                ProviderError::new(
+                    ProviderErrorKind::InvalidRequest,
+                    400,
+                    "credentials must include client_id or a JWT token that embeds client_id",
+                )
+            })
+    }
+
+    fn refresh_scope(envelope: &ProviderAccountEnvelope) -> Option<String> {
+        Self::string_field(envelope, "scope")
+            .or_else(|| Self::string_field(envelope, "oauth_scope"))
+            .map(ToString::to_string)
+    }
+
+    fn decode_jwt_claims(token: &str) -> Option<Value> {
+        let payload = token.split('.').nth(1)?;
+        let bytes = URL_SAFE_NO_PAD
+            .decode(payload)
+            .ok()
+            .or_else(|| URL_SAFE.decode(payload).ok())?;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    fn jwt_client_id(token: &str) -> Option<String> {
+        let claims = Self::decode_jwt_claims(token)?;
+        claims
+            .get("client_id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .or_else(|| {
+                claims
+                    .get("aud")
+                    .and_then(Value::as_array)
+                    .and_then(|values| values.first())
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+            })
+            .or_else(|| {
+                claims
+                    .get("aud")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+            })
+    }
+
+    fn jwt_expiry(token: &str) -> Option<DateTime<Utc>> {
+        let claims = Self::decode_jwt_claims(token)?;
+        let seconds = claims.get("exp").and_then(Value::as_i64).or_else(|| {
+            claims
+                .get("exp")
+                .and_then(Value::as_u64)
+                .and_then(|value| i64::try_from(value).ok())
+        })?;
+        DateTime::from_timestamp(seconds, 0)
     }
 
     fn extract_header_map(value: Option<&Value>) -> BTreeMap<String, String> {
@@ -334,6 +428,97 @@ impl OpenAiCodexProvider {
             .into_iter()
             .map(|model| self.descriptor_for_model(model.id))
             .collect())
+    }
+
+    async fn refresh_with_token_endpoint(
+        &self,
+        envelope: &ProviderAccountEnvelope,
+    ) -> Result<RefreshedProviderCredentials, ProviderError> {
+        self.connection_from_envelope(envelope)?;
+
+        let refresh_token = envelope
+            .credentials
+            .get("refresh_token")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ProviderError::new(
+                    ProviderErrorKind::InvalidRequest,
+                    400,
+                    "credentials must include refresh_token",
+                )
+            })?;
+        let client_id = Self::refresh_client_id(envelope)?;
+        let token_endpoint = Self::refresh_token_endpoint(envelope);
+
+        let mut form = vec![
+            ("grant_type".to_string(), "refresh_token".to_string()),
+            ("refresh_token".to_string(), refresh_token.to_string()),
+            ("client_id".to_string(), client_id),
+        ];
+        if let Some(scope) = Self::refresh_scope(envelope) {
+            form.push(("scope".to_string(), scope));
+        }
+
+        let response = self
+            .client
+            .post(token_endpoint)
+            .header(ACCEPT, "application/json")
+            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .form(&form)
+            .send()
+            .await
+            .map_err(transport_error)?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let headers = response.headers().clone();
+            let body = response.text().await.unwrap_or_default();
+            return Err(oauth_refresh_error(status, &headers, &body));
+        }
+
+        let payload: OAuthRefreshResponse = response.json().await.map_err(transport_error)?;
+        let refreshed_at = Utc::now();
+        let expires_at = payload
+            .expires_in
+            .and_then(TimeDelta::try_seconds)
+            .and_then(|delta| refreshed_at.checked_add_signed(delta))
+            .or_else(|| payload.id_token.as_deref().and_then(Self::jwt_expiry))
+            .or_else(|| Self::jwt_expiry(&payload.access_token));
+
+        let mut credentials = envelope.credentials.clone();
+        let refresh_token = payload
+            .refresh_token
+            .unwrap_or_else(|| refresh_token.to_string());
+
+        if let Some(object) = credentials.as_object_mut() {
+            object.insert(
+                "access_token".to_string(),
+                Value::String(payload.access_token),
+            );
+            object.insert("refresh_token".to_string(), Value::String(refresh_token));
+            object.insert(
+                "last_refresh".to_string(),
+                Value::String(refreshed_at.to_rfc3339()),
+            );
+            if let Some(id_token) = payload.id_token {
+                object.insert("id_token".to_string(), Value::String(id_token));
+            }
+            match expires_at.map(|value| value.to_rfc3339()) {
+                Some(value) => {
+                    object.insert("expired".to_string(), Value::String(value.clone()));
+                    object.insert("expires_at".to_string(), Value::String(value));
+                }
+                None => {
+                    object.remove("expired");
+                    object.remove("expires_at");
+                }
+            }
+        }
+
+        Ok(RefreshedProviderCredentials {
+            credentials,
+            expires_at,
+        })
     }
 
     async fn send_chat_request_with_connection(
@@ -707,6 +892,13 @@ impl ProviderAdapter for OpenAiCodexProvider {
         })
     }
 
+    async fn refresh_credentials(
+        &self,
+        envelope: &ProviderAccountEnvelope,
+    ) -> Result<RefreshedProviderCredentials, ProviderError> {
+        self.refresh_with_token_endpoint(envelope).await
+    }
+
     async fn chat(&self, request: InferenceRequest) -> Result<InferenceResponse, ProviderError> {
         let connection = self.resolve_connection(&request).await?;
         let public_model = request.public_model.clone();
@@ -857,6 +1049,17 @@ impl ModelsApiResponse {
 struct ModelSummary {
     #[serde(alias = "slug")]
     id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OAuthRefreshResponse {
+    access_token: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    id_token: Option<String>,
+    #[serde(default)]
+    expires_in: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1146,6 +1349,67 @@ fn http_status_error(status: StatusCode, headers: &HeaderMap, body: &str) -> Pro
         .and_then(extract_upstream_error_message)
         .unwrap_or_else(|| format!("upstream returned {status}"));
     let code = parsed.as_ref().and_then(extract_upstream_error_code);
+
+    let error = ProviderError::new(kind, status.as_u16(), message);
+    match code {
+        Some(code) => error.with_code(code),
+        None => error,
+    }
+}
+
+fn oauth_refresh_error(status: StatusCode, headers: &HeaderMap, body: &str) -> ProviderError {
+    if headers
+        .get("cf-mitigated")
+        .and_then(|value| value.to_str().ok())
+        == Some("challenge")
+    {
+        return ProviderError::new(
+            ProviderErrorKind::UpstreamUnavailable,
+            503,
+            "Upstream challenge requires interactive verification.",
+        )
+        .with_code("upstream_challenge");
+    }
+
+    let parsed = serde_json::from_str::<Value>(body).ok();
+    let code = parsed
+        .as_ref()
+        .and_then(|value| value.get("error"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .or_else(|| parsed.as_ref().and_then(extract_upstream_error_code));
+    let message = parsed
+        .as_ref()
+        .and_then(|value| {
+            value
+                .get("error_description")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+                .or_else(|| {
+                    value
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string)
+                })
+                .or_else(|| extract_upstream_error_message(value))
+        })
+        .unwrap_or_else(|| format!("oauth token endpoint returned {status}"));
+
+    let kind = match code.as_deref() {
+        Some("invalid_grant")
+        | Some("invalid_client")
+        | Some("invalid_token")
+        | Some("unauthorized_client") => ProviderErrorKind::InvalidCredentials,
+        Some("temporarily_unavailable") => ProviderErrorKind::UpstreamUnavailable,
+        Some("slow_down") => ProviderErrorKind::RateLimited,
+        _ => match status.as_u16() {
+            400 => ProviderErrorKind::InvalidRequest,
+            401 | 403 => ProviderErrorKind::InvalidCredentials,
+            429 => ProviderErrorKind::RateLimited,
+            500..=599 => ProviderErrorKind::UpstreamUnavailable,
+            _ => ProviderErrorKind::Unsupported,
+        },
+    };
 
     let error = ProviderError::new(kind, status.as_u16(), message);
     match code {
@@ -2028,6 +2292,49 @@ mod tests {
         addr
     }
 
+    fn unsigned_jwt(payload: Value) -> String {
+        let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none","typ":"JWT"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(payload.to_string());
+        format!("{header}.{payload}.signature")
+    }
+
+    async fn spawn_refresh_token_server(
+        expected_refresh_token: String,
+        expected_client_id: String,
+        status: HttpStatusCode,
+        body: Value,
+    ) -> SocketAddr {
+        let app = Router::new().route(
+            "/oauth/token",
+            post(move |request: Request| {
+                let expected_refresh_token = expected_refresh_token.clone();
+                let expected_client_id = expected_client_id.clone();
+                let body = body.clone();
+                async move {
+                    let form = axum::body::to_bytes(request.into_body(), usize::MAX)
+                        .await
+                        .expect("refresh body");
+                    let form = String::from_utf8(form.to_vec()).expect("refresh utf8");
+
+                    assert!(form.contains("grant_type=refresh_token"));
+                    assert!(form.contains(&format!("refresh_token={expected_refresh_token}")));
+                    assert!(form.contains(&format!("client_id={expected_client_id}")));
+
+                    (status, axum::Json(body)).into_response()
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+        addr
+    }
+
     async fn setup_provider(
         api_base: &str,
     ) -> (
@@ -2118,6 +2425,99 @@ mod tests {
             .expect("credentials should validate");
 
         assert_eq!(validated.provider_account_id, "acct_123");
+    }
+
+    #[tokio::test]
+    async fn refresh_credentials_derives_client_id_from_jwt_and_rotates_tokens() {
+        let addr = spawn_refresh_token_server(
+            "refresh-token".to_string(),
+            "app_refresh_test".to_string(),
+            HttpStatusCode::OK,
+            json!({
+                "access_token": "fresh-access-token",
+                "refresh_token": "fresh-refresh-token",
+                "id_token": "fresh-id-token",
+                "expires_in": 3600
+            }),
+        )
+        .await;
+
+        let provider = OpenAiCodexProvider::shared(Arc::new(PlatformStore::demo()));
+        let envelope = ProviderAccountEnvelope {
+            provider: "openai_codex".to_string(),
+            credential_kind: "oauth_tokens".to_string(),
+            payload_version: "v1".to_string(),
+            credentials: json!({
+                "access_token": unsigned_jwt(json!({
+                    "client_id": "app_refresh_test",
+                    "exp": 4102444800_u64
+                })),
+                "refresh_token": "refresh-token",
+                "token_endpoint": format!("http://{addr}/oauth/token"),
+                "account_id": "acct_test",
+                "api_base": "https://chatgpt.com/backend-api/codex"
+            }),
+            metadata: json!({}),
+            labels: vec![],
+            tags: BTreeMap::new(),
+        };
+
+        let refreshed = provider
+            .refresh_credentials(&envelope)
+            .await
+            .expect("refresh credentials");
+
+        assert_eq!(
+            refreshed.credentials["access_token"],
+            json!("fresh-access-token")
+        );
+        assert_eq!(
+            refreshed.credentials["refresh_token"],
+            json!("fresh-refresh-token")
+        );
+        assert_eq!(refreshed.credentials["id_token"], json!("fresh-id-token"));
+        assert!(refreshed.expires_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn refresh_credentials_maps_invalid_grant_to_invalid_credentials() {
+        let addr = spawn_refresh_token_server(
+            "refresh-token".to_string(),
+            "app_refresh_test".to_string(),
+            HttpStatusCode::BAD_REQUEST,
+            json!({
+                "error": "invalid_grant",
+                "error_description": "refresh token rejected"
+            }),
+        )
+        .await;
+
+        let provider = OpenAiCodexProvider::shared(Arc::new(PlatformStore::demo()));
+        let envelope = ProviderAccountEnvelope {
+            provider: "openai_codex".to_string(),
+            credential_kind: "oauth_tokens".to_string(),
+            payload_version: "v1".to_string(),
+            credentials: json!({
+                "access_token": unsigned_jwt(json!({
+                    "client_id": "app_refresh_test",
+                    "exp": 4102444800_u64
+                })),
+                "refresh_token": "refresh-token",
+                "token_endpoint": format!("http://{addr}/oauth/token"),
+                "account_id": "acct_test",
+                "api_base": "https://chatgpt.com/backend-api/codex"
+            }),
+            metadata: json!({}),
+            labels: vec![],
+            tags: BTreeMap::new(),
+        };
+
+        let error = provider
+            .refresh_credentials(&envelope)
+            .await
+            .expect_err("refresh should fail");
+        assert_eq!(error.kind, ProviderErrorKind::InvalidCredentials);
+        assert_eq!(error.code.as_deref(), Some("invalid_grant"));
     }
 
     #[tokio::test]

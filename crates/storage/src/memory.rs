@@ -1,11 +1,12 @@
 use crate::{
-    AuditEvent, AuthError, CreatedApiKey, GatewayAuthContext, Permission, ProviderAccountRecord,
-    RequestRecord, Role, RouteGroupBindingRecord, RouteGroupRecord, ScopeTarget,
-    ServiceAccountPrincipal, StoreError, Tenant, TenantApiKeyStatus, TenantApiKeyView,
+    AccountInspectionRecord, AccountInspectionStatus, AuditEvent, AuthError, CreatedApiKey,
+    GatewayAuthContext, Permission, ProbeDispatchLease, ProviderAccountRecord,
+    RefreshDispatchLease, RequestRecord, Role, RouteGroupBindingRecord, RouteGroupRecord,
+    ScopeTarget, ServiceAccountPrincipal, StoreError, Tenant, TenantApiKeyStatus, TenantApiKeyView,
     TenantManagementPrincipal, UsageSummary, provider_connection_from_parts, role_allows,
     scope_allows,
 };
-use chrono::Utc;
+use chrono::{TimeDelta, Utc};
 use protocol_core::{ModelCapability, ModelDescriptor, TokenUsage};
 use provider_core::{
     AccountCapabilities, ProviderAccountEnvelope, ProviderConnectionInfo, ValidatedProviderAccount,
@@ -45,6 +46,9 @@ struct InnerStore {
     runtimes: RwLock<HashMap<Uuid, AccountRuntime>>,
     requests: RwLock<Vec<RequestRecord>>,
     audits: RwLock<Vec<AuditEvent>>,
+    inspections: RwLock<Vec<AccountInspectionRecord>>,
+    probe_leases: RwLock<HashMap<Uuid, ProbeDispatchLease>>,
+    refresh_leases: RwLock<HashMap<Uuid, RefreshDispatchLease>>,
 }
 
 impl Default for InMemoryPlatformStore {
@@ -69,6 +73,9 @@ impl InMemoryPlatformStore {
             runtimes: RwLock::new(HashMap::new()),
             requests: RwLock::new(Vec::new()),
             audits: RwLock::new(Vec::new()),
+            inspections: RwLock::new(Vec::new()),
+            probe_leases: RwLock::new(HashMap::new()),
+            refresh_leases: RwLock::new(HashMap::new()),
         };
 
         Self {
@@ -197,6 +204,9 @@ impl InMemoryPlatformStore {
             )])),
             requests: RwLock::new(Vec::new()),
             audits: RwLock::new(Vec::new()),
+            inspections: RwLock::new(Vec::new()),
+            probe_leases: RwLock::new(HashMap::new()),
+            refresh_leases: RwLock::new(HashMap::new()),
         };
 
         Self {
@@ -571,6 +581,97 @@ impl InMemoryPlatformStore {
             .collect())
     }
 
+    pub async fn provider_account(
+        &self,
+        account_id: Uuid,
+    ) -> Result<Option<ProviderAccountRecord>, StoreError> {
+        Ok(self
+            .inner
+            .provider_accounts
+            .read()
+            .await
+            .get(&account_id)
+            .cloned())
+    }
+
+    pub async fn record_account_inspection(
+        &self,
+        provider_account_id: Uuid,
+        actor: String,
+        status: AccountInspectionStatus,
+        error_kind: Option<String>,
+        error_code: Option<String>,
+        error_message: Option<String>,
+    ) -> Result<AccountInspectionRecord, StoreError> {
+        let record = AccountInspectionRecord {
+            id: Uuid::new_v4(),
+            provider_account_id,
+            actor,
+            status,
+            error_kind,
+            error_code,
+            error_message,
+            inspected_at: Utc::now(),
+        };
+        self.inner.inspections.write().await.push(record.clone());
+        Ok(record)
+    }
+
+    pub async fn list_account_inspections(
+        &self,
+        provider_account_id: Uuid,
+    ) -> Result<Vec<AccountInspectionRecord>, StoreError> {
+        let mut inspections = self
+            .inner
+            .inspections
+            .read()
+            .await
+            .iter()
+            .filter(|inspection| inspection.provider_account_id == provider_account_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        inspections.sort_by(|left, right| {
+            right
+                .inspected_at
+                .cmp(&left.inspected_at)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        Ok(inspections)
+    }
+
+    pub async fn provider_account_envelope(
+        &self,
+        account_id: Uuid,
+    ) -> Result<Option<ProviderAccountEnvelope>, StoreError> {
+        let account = self
+            .inner
+            .provider_accounts
+            .read()
+            .await
+            .get(&account_id)
+            .cloned();
+        let credentials = self
+            .inner
+            .provider_credentials
+            .read()
+            .await
+            .get(&account_id)
+            .cloned();
+
+        Ok(match (account, credentials) {
+            (Some(account), Some(credentials)) => Some(ProviderAccountEnvelope {
+                provider: account.provider,
+                credential_kind: account.credential_kind,
+                payload_version: account.payload_version,
+                credentials,
+                metadata: account.metadata,
+                labels: account.labels,
+                tags: account.tags,
+            }),
+            _ => None,
+        })
+    }
+
     pub async fn ingest_provider_account(
         &self,
         envelope: ProviderAccountEnvelope,
@@ -622,6 +723,69 @@ impl InMemoryPlatformStore {
             .insert(record.id, credentials);
 
         Ok(record)
+    }
+
+    pub async fn revalidate_provider_account(
+        &self,
+        account_id: Uuid,
+        validated: ValidatedProviderAccount,
+        capabilities: AccountCapabilities,
+    ) -> Result<Option<ProviderAccountRecord>, StoreError> {
+        let mut accounts = self.inner.provider_accounts.write().await;
+        let Some(record) = accounts.get_mut(&account_id) else {
+            return Ok(None);
+        };
+
+        record.state = AccountState::Active;
+        record.external_account_id = validated.provider_account_id;
+        record.redacted_display = validated.redacted_display;
+        record.capabilities = capabilities
+            .models
+            .iter()
+            .map(|model| model.id.clone())
+            .collect();
+        record.expires_at = validated.expires_at;
+        record.last_validated_at = Some(Utc::now());
+
+        if let Some(runtime) = self.inner.runtimes.write().await.get_mut(&account_id) {
+            runtime.state = AccountState::Active;
+            runtime.cooldown_until = None;
+            runtime.circuit_open_until = None;
+            runtime.consecutive_failures = 0;
+        }
+
+        Ok(Some(record.clone()))
+    }
+
+    pub async fn rotate_provider_account_secret(
+        &self,
+        account_id: Uuid,
+        credentials: Value,
+        expires_at: Option<chrono::DateTime<Utc>>,
+    ) -> Result<Option<ProviderAccountRecord>, StoreError> {
+        let mut accounts = self.inner.provider_accounts.write().await;
+        let Some(record) = accounts.get_mut(&account_id) else {
+            return Ok(None);
+        };
+
+        record.state = AccountState::Active;
+        record.expires_at = expires_at;
+        record.last_validated_at = Some(Utc::now());
+
+        self.inner
+            .provider_credentials
+            .write()
+            .await
+            .insert(account_id, credentials);
+
+        if let Some(runtime) = self.inner.runtimes.write().await.get_mut(&account_id) {
+            runtime.state = AccountState::Active;
+            runtime.cooldown_until = None;
+            runtime.circuit_open_until = None;
+            runtime.consecutive_failures = 0;
+        }
+
+        Ok(Some(record.clone()))
     }
 
     pub async fn set_provider_account_state(
@@ -780,6 +944,113 @@ impl InMemoryPlatformStore {
             }
         }
         Ok(())
+    }
+
+    pub async fn dispatch_due_provider_account_probes(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ProbeDispatchLease>, StoreError> {
+        let now = Utc::now();
+        let accounts = self.inner.provider_accounts.read().await;
+        let mut leases = self.inner.probe_leases.write().await;
+
+        leases.retain(|_, lease| lease.leased_until > now);
+
+        let mut due_accounts = accounts
+            .values()
+            .filter(|account| {
+                matches!(
+                    account.state,
+                    AccountState::Active | AccountState::Cooling | AccountState::QuotaExhausted
+                ) && !leases.contains_key(&account.id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        due_accounts.sort_by(|left, right| {
+            left.last_validated_at
+                .cmp(&right.last_validated_at)
+                .then(left.created_at.cmp(&right.created_at))
+                .then(left.id.cmp(&right.id))
+        });
+
+        let selected = due_accounts
+            .into_iter()
+            .take(limit)
+            .map(|account| {
+                let lease = ProbeDispatchLease {
+                    lease_id: Uuid::new_v4(),
+                    account_id: account.id,
+                    leased_at: now,
+                    leased_until: now + TimeDelta::minutes(5),
+                };
+                leases.insert(account.id, lease.clone());
+                lease
+            })
+            .collect();
+
+        Ok(selected)
+    }
+
+    pub async fn dispatch_due_provider_account_refreshes(
+        &self,
+        limit: usize,
+        refresh_before_seconds: i64,
+    ) -> Result<Vec<RefreshDispatchLease>, StoreError> {
+        let now = Utc::now();
+        let refresh_before =
+            TimeDelta::try_seconds(refresh_before_seconds.max(0)).unwrap_or_else(TimeDelta::zero);
+        let due_before = now + refresh_before;
+        let accounts = self.inner.provider_accounts.read().await;
+        let credentials = self.inner.provider_credentials.read().await;
+        let mut leases = self.inner.refresh_leases.write().await;
+
+        leases.retain(|_, lease| lease.leased_until > now);
+
+        let mut due_accounts = accounts
+            .values()
+            .filter(|account| {
+                matches!(
+                    account.state,
+                    AccountState::Active | AccountState::Cooling | AccountState::QuotaExhausted
+                ) && account.credential_kind == "oauth_tokens"
+                    && account
+                        .expires_at
+                        .is_some_and(|expires_at| expires_at <= due_before)
+                    && !leases.contains_key(&account.id)
+                    && credentials
+                        .get(&account.id)
+                        .and_then(|value| value.get("refresh_token"))
+                        .and_then(Value::as_str)
+                        .is_some()
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        due_accounts.sort_by(|left, right| {
+            left.expires_at
+                .cmp(&right.expires_at)
+                .then(left.last_validated_at.cmp(&right.last_validated_at))
+                .then(left.created_at.cmp(&right.created_at))
+                .then(left.id.cmp(&right.id))
+        });
+
+        let selected = due_accounts
+            .into_iter()
+            .take(limit)
+            .map(|account| {
+                let lease = RefreshDispatchLease {
+                    lease_id: Uuid::new_v4(),
+                    account_id: account.id,
+                    leased_at: now,
+                    leased_until: now + TimeDelta::minutes(5),
+                };
+                leases.insert(account.id, lease.clone());
+                lease
+            })
+            .collect();
+
+        Ok(selected)
     }
 
     pub async fn choose_candidate(

@@ -114,7 +114,36 @@ create table if not exists account_runtime (
   health_score integer not null default 100,
   cooldown_until timestamptz,
   circuit_open_until timestamptz,
+  consecutive_failures integer not null default 0,
   in_flight integer not null default 0,
   max_in_flight integer not null default 8,
   last_used_at timestamptz
+);
+
+alter table account_runtime
+  add column if not exists consecutive_failures integer not null default 0;
+
+create table if not exists account_inspections (
+  id uuid primary key,
+  provider_account_id uuid not null references provider_accounts(id),
+  actor text not null,
+  status text not null,
+  error_kind text,
+  error_code text,
+  error_message text,
+  inspected_at timestamptz not null default now()
+);
+
+create table if not exists account_probe_leases (
+  provider_account_id uuid primary key references provider_accounts(id),
+  lease_id uuid not null,
+  leased_at timestamptz not null default now(),
+  leased_until timestamptz not null
+);
+
+create table if not exists account_refresh_leases (
+  provider_account_id uuid primary key references provider_accounts(id),
+  lease_id uuid not null,
+  leased_at timestamptz not null default now(),
+  leased_until timestamptz not null
 );

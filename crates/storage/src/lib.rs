@@ -140,6 +140,41 @@ pub struct ProviderAccountRecord {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountInspectionStatus {
+    Healthy,
+    Unhealthy,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AccountInspectionRecord {
+    pub id: Uuid,
+    pub provider_account_id: Uuid,
+    pub actor: String,
+    pub status: AccountInspectionStatus,
+    pub error_kind: Option<String>,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
+    pub inspected_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProbeDispatchLease {
+    pub lease_id: Uuid,
+    pub account_id: Uuid,
+    pub leased_at: DateTime<Utc>,
+    pub leased_until: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RefreshDispatchLease {
+    pub lease_id: Uuid,
+    pub account_id: Uuid,
+    pub leased_at: DateTime<Utc>,
+    pub leased_until: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RouteGroupRecord {
     pub id: Uuid,
     pub slug: String,
@@ -438,6 +473,74 @@ impl PlatformStore {
         }
     }
 
+    pub async fn provider_account(
+        &self,
+        account_id: Uuid,
+    ) -> Result<Option<ProviderAccountRecord>, StoreError> {
+        match self {
+            Self::InMemory(store) => store.provider_account(account_id).await,
+            Self::Postgres(store) => store.provider_account(account_id).await,
+        }
+    }
+
+    pub async fn record_account_inspection(
+        &self,
+        provider_account_id: Uuid,
+        actor: impl Into<String>,
+        status: AccountInspectionStatus,
+        error_kind: Option<String>,
+        error_code: Option<String>,
+        error_message: Option<String>,
+    ) -> Result<AccountInspectionRecord, StoreError> {
+        let actor = actor.into();
+        match self {
+            Self::InMemory(store) => {
+                store
+                    .record_account_inspection(
+                        provider_account_id,
+                        actor,
+                        status,
+                        error_kind,
+                        error_code,
+                        error_message,
+                    )
+                    .await
+            }
+            Self::Postgres(store) => {
+                store
+                    .record_account_inspection(
+                        provider_account_id,
+                        actor,
+                        status,
+                        error_kind,
+                        error_code,
+                        error_message,
+                    )
+                    .await
+            }
+        }
+    }
+
+    pub async fn list_account_inspections(
+        &self,
+        provider_account_id: Uuid,
+    ) -> Result<Vec<AccountInspectionRecord>, StoreError> {
+        match self {
+            Self::InMemory(store) => store.list_account_inspections(provider_account_id).await,
+            Self::Postgres(store) => store.list_account_inspections(provider_account_id).await,
+        }
+    }
+
+    pub async fn provider_account_envelope(
+        &self,
+        account_id: Uuid,
+    ) -> Result<Option<ProviderAccountEnvelope>, StoreError> {
+        match self {
+            Self::InMemory(store) => store.provider_account_envelope(account_id).await,
+            Self::Postgres(store) => store.provider_account_envelope(account_id).await,
+        }
+    }
+
     pub async fn ingest_provider_account(
         &self,
         envelope: ProviderAccountEnvelope,
@@ -453,6 +556,46 @@ impl PlatformStore {
             Self::Postgres(store) => {
                 store
                     .ingest_provider_account(envelope, validated, capabilities)
+                    .await
+            }
+        }
+    }
+
+    pub async fn revalidate_provider_account(
+        &self,
+        account_id: Uuid,
+        validated: ValidatedProviderAccount,
+        capabilities: AccountCapabilities,
+    ) -> Result<Option<ProviderAccountRecord>, StoreError> {
+        match self {
+            Self::InMemory(store) => {
+                store
+                    .revalidate_provider_account(account_id, validated, capabilities)
+                    .await
+            }
+            Self::Postgres(store) => {
+                store
+                    .revalidate_provider_account(account_id, validated, capabilities)
+                    .await
+            }
+        }
+    }
+
+    pub async fn rotate_provider_account_secret(
+        &self,
+        account_id: Uuid,
+        credentials: Value,
+        expires_at: Option<DateTime<Utc>>,
+    ) -> Result<Option<ProviderAccountRecord>, StoreError> {
+        match self {
+            Self::InMemory(store) => {
+                store
+                    .rotate_provider_account_secret(account_id, credentials, expires_at)
+                    .await
+            }
+            Self::Postgres(store) => {
+                store
+                    .rotate_provider_account_secret(account_id, credentials, expires_at)
                     .await
             }
         }
@@ -565,6 +708,35 @@ impl PlatformStore {
         match self {
             Self::InMemory(store) => store.choose_candidate(public_model).await,
             Self::Postgres(store) => store.choose_candidate(public_model).await,
+        }
+    }
+
+    pub async fn dispatch_due_provider_account_probes(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ProbeDispatchLease>, StoreError> {
+        match self {
+            Self::InMemory(store) => store.dispatch_due_provider_account_probes(limit).await,
+            Self::Postgres(store) => store.dispatch_due_provider_account_probes(limit).await,
+        }
+    }
+
+    pub async fn dispatch_due_provider_account_refreshes(
+        &self,
+        limit: usize,
+        refresh_before_seconds: i64,
+    ) -> Result<Vec<RefreshDispatchLease>, StoreError> {
+        match self {
+            Self::InMemory(store) => {
+                store
+                    .dispatch_due_provider_account_refreshes(limit, refresh_before_seconds)
+                    .await
+            }
+            Self::Postgres(store) => {
+                store
+                    .dispatch_due_provider_account_refreshes(limit, refresh_before_seconds)
+                    .await
+            }
         }
     }
 
