@@ -272,7 +272,8 @@ mod tests {
         body::{Body, to_bytes},
         http::{Request, header},
     };
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::OnceLock;
+    use tokio::sync::Mutex;
     use tower::util::ServiceExt;
 
     fn env_lock() -> &'static Mutex<()> {
@@ -408,7 +409,7 @@ mod tests {
 
     #[tokio::test]
     async fn cors_preflight_allows_explicit_origin() {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = env_lock().lock().await;
         unsafe {
             std::env::set_var(
                 "FERRUMGATE_TENANT_API_ALLOWED_ORIGINS",
@@ -447,7 +448,7 @@ mod tests {
 
     #[tokio::test]
     async fn cors_preflight_does_not_allow_unconfigured_origin() {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = env_lock().lock().await;
         unsafe {
             std::env::set_var(
                 "FERRUMGATE_TENANT_API_ALLOWED_ORIGINS",

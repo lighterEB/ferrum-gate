@@ -70,7 +70,7 @@ impl OpenAiCodexProvider {
         ]
     }
 
-    fn credential_secret<'a>(envelope: &'a ProviderAccountEnvelope) -> Option<&'a str> {
+    fn credential_secret(envelope: &ProviderAccountEnvelope) -> Option<&str> {
         envelope
             .credentials
             .get("access_token")
@@ -598,7 +598,7 @@ impl OpenAiCodexProvider {
         connection: &ProviderConnectionInfo,
         stream: bool,
     ) -> Result<Response, ProviderError> {
-        let model = self.effective_model(request, &connection);
+        let model = self.effective_model(request, connection);
         let payload = json!({
             "model": model,
             "messages": request.messages.iter().map(chat_message_payload).collect::<Vec<_>>(),
@@ -610,7 +610,7 @@ impl OpenAiCodexProvider {
             .client
             .post(Self::endpoint_url(&connection.api_base, "chat/completions"))
             .bearer_auth(&connection.bearer_token)
-            .headers(self.build_headers(&connection)?)
+            .headers(self.build_headers(connection)?)
             .json(&payload)
             .send()
             .await
@@ -625,7 +625,7 @@ impl OpenAiCodexProvider {
         connection: &ProviderConnectionInfo,
         stream: bool,
     ) -> Result<Response, ProviderError> {
-        let model = self.effective_model(request, &connection);
+        let model = self.effective_model(request, connection);
         let tools = Self::tool_payloads(request);
         let payload = if Self::uses_chatgpt_codex_endpoint(connection) {
             json!({
@@ -653,7 +653,7 @@ impl OpenAiCodexProvider {
             .client
             .post(Self::endpoint_url(&connection.api_base, "responses"))
             .bearer_auth(&connection.bearer_token)
-            .headers(self.build_headers(&connection)?)
+            .headers(self.build_headers(connection)?)
             .json(&payload)
             .send()
             .await
