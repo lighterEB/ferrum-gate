@@ -1,0 +1,8 @@
+.git
+.github
+target
+node_modules
+web/tenant-console/node_modules
+web/tenant-console/dist
+**/.DS_Store
+

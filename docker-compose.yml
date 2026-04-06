@@ -1,14 +1,91 @@
 services:
   postgres:
     image: postgres:16
+    restart: unless-stopped
     environment:
-      POSTGRES_DB: ferrum_gate
-      POSTGRES_PASSWORD: ferrum_gate
-      POSTGRES_USER: ferrum_gate
+      POSTGRES_DB: ${POSTGRES_DB:-ferrum_gate}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ferrum_gate}
+      POSTGRES_USER: ${POSTGRES_USER:-ferrum_gate}
     ports:
-      - "5432:5432"
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ferrum_gate -d ferrum_gate"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ferrum_gate} -d ${POSTGRES_DB:-ferrum_gate}"]
       interval: 10s
       timeout: 5s
       retries: 5
+
+  gateway-http:
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+      args:
+        APP_BIN: gateway-http
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgres://ferrum_gate:ferrum_gate@postgres:5432/ferrum_gate}
+      FERRUMGATE_MASTER_KEY: ${FERRUMGATE_MASTER_KEY:-local-dev-master-key}
+      FERRUMGATE_SEED_DEMO_DATA: ${FERRUMGATE_SEED_DEMO_DATA:-true}
+      FERRUMGATE_GATEWAY_HTTP_ADDR: 0.0.0.0:3005
+      FERRUMGATE_TENANT_API_ALLOWED_ORIGINS: ${FERRUMGATE_TENANT_API_ALLOWED_ORIGINS:-}
+      FERRUMGATE_CONSOLE_ALLOWED_ORIGINS: ${FERRUMGATE_CONSOLE_ALLOWED_ORIGINS:-}
+    ports:
+      - "${GATEWAY_HTTP_PORT:-3005}:3005"
+
+  tenant-api:
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+      args:
+        APP_BIN: tenant-api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgres://ferrum_gate:ferrum_gate@postgres:5432/ferrum_gate}
+      FERRUMGATE_MASTER_KEY: ${FERRUMGATE_MASTER_KEY:-local-dev-master-key}
+      FERRUMGATE_SEED_DEMO_DATA: ${FERRUMGATE_SEED_DEMO_DATA:-true}
+      FERRUMGATE_TENANT_API_ADDR: 0.0.0.0:3006
+      FERRUMGATE_TENANT_API_ALLOWED_ORIGINS: ${FERRUMGATE_TENANT_API_ALLOWED_ORIGINS:-}
+    ports:
+      - "${TENANT_API_PORT:-3006}:3006"
+
+  control-plane:
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+      args:
+        APP_BIN: control-plane
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgres://ferrum_gate:ferrum_gate@postgres:5432/ferrum_gate}
+      FERRUMGATE_MASTER_KEY: ${FERRUMGATE_MASTER_KEY:-local-dev-master-key}
+      FERRUMGATE_SEED_DEMO_DATA: ${FERRUMGATE_SEED_DEMO_DATA:-true}
+      FERRUMGATE_CONTROL_PLANE_ADDR: 0.0.0.0:3007
+      FERRUMGATE_TENANT_API_ALLOWED_ORIGINS: ${FERRUMGATE_TENANT_API_ALLOWED_ORIGINS:-}
+      FERRUMGATE_CONSOLE_ALLOWED_ORIGINS: ${FERRUMGATE_CONSOLE_ALLOWED_ORIGINS:-}
+    ports:
+      - "${CONTROL_PLANE_PORT:-3007}:3007"
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on:
+      - gateway-http
+      - tenant-api
+      - control-plane
+    ports:
+      - "${NGINX_PORT:-80}:80"
+    volumes:
+      - ./docker/nginx/backend.conf:/etc/nginx/conf.d/default.conf:ro
+
+volumes:
+  postgres_data:

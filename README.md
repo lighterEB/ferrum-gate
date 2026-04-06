@@ -84,6 +84,60 @@ Default addresses:
 - `control-plane`: `127.0.0.1:3007`
 - `tenant-console`: `127.0.0.1:5173`
 
+## Backend-Only Docker Compose
+
+For a VPS deployment that only needs the APIs, you can now run Postgres plus the three backend services with Docker Compose, fronted by Nginx.
+
+1. Copy the environment template:
+
+```bash
+cp .env.example .env
+```
+
+2. Edit `.env` for your server:
+
+```bash
+FERRUMGATE_MASTER_KEY=<strong-random-secret>
+FERRUMGATE_SEED_DEMO_DATA=true
+```
+
+If you want Compose to use its bundled Postgres service, leave:
+
+```bash
+DATABASE_URL=postgres://ferrum_gate:ferrum_gate@postgres:5432/ferrum_gate
+```
+
+If you want to use an external Postgres instead, replace `DATABASE_URL` with that external connection string.
+
+3. Start the backend stack:
+
+```bash
+docker compose up -d --build
+```
+
+4. Verify the services:
+
+```bash
+curl http://127.0.0.1/health
+curl http://127.0.0.1/v1/models -H "Authorization: Bearer fgk_demo_gateway_key"
+curl http://127.0.0.1/tenant/v1/me -H "Authorization: Bearer fg_tenant_admin_demo"
+curl http://127.0.0.1/internal/v1/provider-accounts -H "Authorization: Bearer fg_cp_admin_demo"
+```
+
+This backend-only deployment is enough to:
+
+- upload provider accounts through `control-plane`
+- create downstream API keys through `tenant-api`
+- serve OpenAI-compatible chat and responses traffic through `gateway-http`
+
+Security note:
+
+- Nginx listens on `NGINX_PORT` and proxies:
+- `/health` and `/v1/*` -> `gateway-http`
+- `/tenant/*` -> `tenant-api`
+- `/internal/*` and `/external/*` -> `control-plane`
+- `tenant-api` and `control-plane` should still usually be restricted by firewall, reverse proxy auth, or source IP allowlists if they are reachable from untrusted networks
+
 ## Tenant Console
 
 The tenant self-service console lives in `web/tenant-console` and is managed with Bun.

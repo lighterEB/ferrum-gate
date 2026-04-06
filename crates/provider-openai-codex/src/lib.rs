@@ -330,7 +330,7 @@ impl OpenAiCodexProvider {
     }
 
     fn codex_models_client_version() -> &'static str {
-        "1.0.0"
+        "0.118.0"
     }
 
     fn build_headers(
@@ -1964,7 +1964,7 @@ mod tests {
             let query = request.uri().query().unwrap_or_default().to_string();
 
             assert_eq!(auth, "Bearer test-token");
-            assert_eq!(query, "client_version=1.0.0");
+            assert_eq!(query, "client_version=0.118.0");
 
             axum::Json(json!({
                 "models": [
