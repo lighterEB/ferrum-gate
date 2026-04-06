@@ -21,7 +21,7 @@ use reqwest::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use uuid::Uuid;
 
 pub struct OpenAiCodexProvider {
@@ -33,7 +33,11 @@ impl OpenAiCodexProvider {
     #[must_use]
     pub fn shared(resolver: Arc<dyn ProviderCredentialResolver>) -> Arc<Self> {
         Arc::new(Self {
-            client: Client::new(),
+            client: Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .read_timeout(Duration::from_secs(300))
+                .build()
+                .expect("build openai codex client"),
             resolver,
         })
     }
