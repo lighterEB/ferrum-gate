@@ -1,0 +1,16 @@
+{
+  "name": "ferrum-gate-web",
+  "private": true,
+  "packageManager": "bun@1.3.9",
+  "workspaces": [
+    "web/*"
+  ],
+  "scripts": {
+    "dev:tenant-console": "bun run --cwd web/tenant-console dev",
+    "build:tenant-console": "bun run --cwd web/tenant-console build",
+    "lint": "bun run --cwd web/tenant-console lint",
+    "typecheck": "bun run --cwd web/tenant-console typecheck",
+    "test": "bun run --cwd web/tenant-console test",
+    "test:e2e": "bun run --cwd web/tenant-console test:e2e"
+  }
+}

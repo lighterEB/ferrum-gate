@@ -3,7 +3,7 @@ use async_stream::stream;
 use axum::{
     Router,
     extract::State,
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, Method, StatusCode},
     response::{
         IntoResponse, Json, Response,
         sse::{Event, Sse},
@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, convert::Infallible, net::SocketAddr, sync::Arc};
 use storage::{GatewayAuthContext, PlatformStore};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::info;
 use uuid::Uuid;
 
@@ -43,12 +44,18 @@ impl GatewayAppState {
 }
 
 pub fn app(state: GatewayAppState) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/responses", post(responses))
-        .with_state(state)
+        .with_state(state);
+
+    if let Some(cors) = console_cors_layer() {
+        router.layer(cors)
+    } else {
+        router
+    }
 }
 
 pub async fn run(addr: SocketAddr, state: GatewayAppState) -> Result<()> {
@@ -56,6 +63,33 @@ pub async fn run(addr: SocketAddr, state: GatewayAppState) -> Result<()> {
     info!("gateway-http listening on {addr}");
     axum::serve(listener, app(state)).await?;
     Ok(())
+}
+
+fn console_cors_layer() -> Option<CorsLayer> {
+    let allowed_origins = std::env::var("FERRUMGATE_CONSOLE_ALLOWED_ORIGINS")
+        .or_else(|_| std::env::var("FERRUMGATE_TENANT_API_ALLOWED_ORIGINS"))
+        .ok()?;
+    let origins = allowed_origins
+        .split(',')
+        .map(str::trim)
+        .filter(|origin| !origin.is_empty())
+        .map(HeaderValue::from_str)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+
+    if origins.is_empty() {
+        return None;
+    }
+
+    Some(
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::list(origins))
+            .allow_methods([Method::GET, Method::POST])
+            .allow_headers([
+                axum::http::header::AUTHORIZATION,
+                axum::http::header::CONTENT_TYPE,
+            ]),
+    )
 }
 
 async fn health() -> Json<Value> {

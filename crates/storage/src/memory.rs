@@ -1,15 +1,17 @@
 use crate::{
-    AccountInspectionRecord, AccountInspectionStatus, AuditEvent, AuthError, CreatedApiKey,
-    GatewayAuthContext, Permission, ProbeDispatchLease, ProviderAccountRecord,
-    RefreshDispatchLease, RequestRecord, Role, RouteGroupBindingRecord, RouteGroupRecord,
-    ScopeTarget, ServiceAccountPrincipal, StoreError, Tenant, TenantApiKeyStatus, TenantApiKeyView,
-    TenantManagementPrincipal, UsageSummary, provider_connection_from_parts, role_allows,
-    scope_allows,
+    AccountInspectionRecord, AccountInspectionStatus, AlertDeliveryReceipt, AuditEvent, AuthError,
+    CreatedApiKey, GatewayAuthContext, Permission, ProbeDispatchLease,
+    ProviderAccountQuotaSnapshotRecord, ProviderAccountRecord, RefreshDispatchLease, RequestRecord,
+    Role, RouteGroupBindingRecord, RouteGroupRecord, ScopeTarget, ServiceAccountPrincipal,
+    StoreError, Tenant, TenantApiKeyStatus, TenantApiKeyView, TenantManagementPrincipal,
+    UsageSummary, default_model_capabilities, derive_route_group_slug,
+    provider_connection_from_parts, role_allows, scope_allows,
 };
 use chrono::{TimeDelta, Utc};
-use protocol_core::{ModelCapability, ModelDescriptor, TokenUsage};
+use protocol_core::{ModelDescriptor, TokenUsage};
 use provider_core::{
-    AccountCapabilities, ProviderAccountEnvelope, ProviderConnectionInfo, ValidatedProviderAccount,
+    AccountCapabilities, ProviderAccountEnvelope, ProviderConnectionInfo, QuotaSnapshot,
+    ValidatedProviderAccount,
 };
 use scheduler::{
     AccountRuntime, AccountState, ProviderAccountCandidate, ProviderOutcome, select_candidate,
@@ -46,9 +48,62 @@ struct InnerStore {
     runtimes: RwLock<HashMap<Uuid, AccountRuntime>>,
     requests: RwLock<Vec<RequestRecord>>,
     audits: RwLock<Vec<AuditEvent>>,
+    alert_deliveries: RwLock<Vec<AlertDeliveryReceipt>>,
     inspections: RwLock<Vec<AccountInspectionRecord>>,
+    quota_snapshots: RwLock<HashMap<Uuid, ProviderAccountQuotaSnapshotRecord>>,
     probe_leases: RwLock<HashMap<Uuid, ProbeDispatchLease>>,
     refresh_leases: RwLock<HashMap<Uuid, RefreshDispatchLease>>,
+}
+
+const AUTO_BINDING_WEIGHT: u32 = 100;
+const AUTO_BINDING_MAX_IN_FLIGHT: u32 = 16;
+
+fn ensure_route_group_and_binding_in_maps(
+    route_groups: &mut BTreeMap<Uuid, RouteGroupRecord>,
+    bindings: &mut BTreeMap<Uuid, RouteGroupBindingRecord>,
+    runtimes: &mut HashMap<Uuid, AccountRuntime>,
+    provider_kind: &str,
+    upstream_model: &str,
+    account_id: Uuid,
+) {
+    let route_group_id = route_groups
+        .values()
+        .find(|route_group| {
+            route_group.public_model == upstream_model && route_group.provider_kind == provider_kind
+        })
+        .map(|route_group| route_group.id)
+        .unwrap_or_else(|| {
+            let record = RouteGroupRecord {
+                id: Uuid::new_v4(),
+                slug: derive_route_group_slug(provider_kind, upstream_model),
+                public_model: upstream_model.to_string(),
+                provider_kind: provider_kind.to_string(),
+                upstream_model: upstream_model.to_string(),
+                created_at: Utc::now(),
+            };
+            let id = record.id;
+            route_groups.insert(record.id, record);
+            id
+        });
+
+    if bindings.values().any(|binding| {
+        binding.route_group_id == route_group_id && binding.provider_account_id == account_id
+    }) {
+        return;
+    }
+
+    runtimes
+        .entry(account_id)
+        .or_insert_with(|| AccountRuntime::new(AccountState::Active, AUTO_BINDING_MAX_IN_FLIGHT));
+    let binding = RouteGroupBindingRecord {
+        id: Uuid::new_v4(),
+        route_group_id,
+        provider_account_id: account_id,
+        weight: AUTO_BINDING_WEIGHT,
+        max_in_flight: AUTO_BINDING_MAX_IN_FLIGHT,
+        created_at: Utc::now(),
+    };
+    bindings.insert(binding.id, binding);
 }
 
 impl Default for InMemoryPlatformStore {
@@ -73,7 +128,9 @@ impl InMemoryPlatformStore {
             runtimes: RwLock::new(HashMap::new()),
             requests: RwLock::new(Vec::new()),
             audits: RwLock::new(Vec::new()),
+            alert_deliveries: RwLock::new(Vec::new()),
             inspections: RwLock::new(Vec::new()),
+            quota_snapshots: RwLock::new(HashMap::new()),
             probe_leases: RwLock::new(HashMap::new()),
             refresh_leases: RwLock::new(HashMap::new()),
         };
@@ -87,14 +144,10 @@ impl InMemoryPlatformStore {
     pub fn demo() -> Self {
         let tenant_id =
             Uuid::parse_str("00000000-0000-0000-0000-000000000001").expect("valid uuid");
-        let route_group_id =
-            Uuid::parse_str("00000000-0000-0000-0000-000000000101").expect("valid uuid");
         let provider_account_id =
             Uuid::parse_str("00000000-0000-0000-0000-000000000201").expect("valid uuid");
         let api_key_id =
             Uuid::parse_str("00000000-0000-0000-0000-000000000301").expect("valid uuid");
-        let binding_id =
-            Uuid::parse_str("00000000-0000-0000-0000-000000000401").expect("valid uuid");
         let now = Utc::now();
 
         let tenant = Tenant {
@@ -137,23 +190,22 @@ impl InMemoryPlatformStore {
             created_at: now,
         };
 
-        let route_group = RouteGroupRecord {
-            id: route_group_id,
-            slug: "openai-gpt-4-1-mini".to_string(),
-            public_model: "gpt-4.1-mini".to_string(),
-            provider_kind: "openai_codex".to_string(),
-            upstream_model: "gpt-4.1-mini".to_string(),
-            created_at: now,
-        };
-
-        let binding = RouteGroupBindingRecord {
-            id: binding_id,
-            route_group_id,
+        let mut route_groups = BTreeMap::new();
+        let mut route_group_bindings = BTreeMap::new();
+        let mut runtimes = HashMap::from([(
             provider_account_id,
-            weight: 100,
-            max_in_flight: 16,
-            created_at: now,
-        };
+            AccountRuntime::new(AccountState::Active, AUTO_BINDING_MAX_IN_FLIGHT),
+        )]);
+        for model in &provider_account.capabilities {
+            ensure_route_group_and_binding_in_maps(
+                &mut route_groups,
+                &mut route_group_bindings,
+                &mut runtimes,
+                &provider_account.provider,
+                model,
+                provider_account_id,
+            );
+        }
 
         let inner = InnerStore {
             tenants: RwLock::new(BTreeMap::from([(tenant_id, tenant)])),
@@ -196,15 +248,14 @@ impl InMemoryPlatformStore {
                     "api_base": "https://api.openai.com/v1"
                 }),
             )])),
-            route_groups: RwLock::new(BTreeMap::from([(route_group_id, route_group)])),
-            route_group_bindings: RwLock::new(BTreeMap::from([(binding_id, binding)])),
-            runtimes: RwLock::new(HashMap::from([(
-                provider_account_id,
-                AccountRuntime::new(AccountState::Active, 16),
-            )])),
+            route_groups: RwLock::new(route_groups),
+            route_group_bindings: RwLock::new(route_group_bindings),
+            runtimes: RwLock::new(runtimes),
             requests: RwLock::new(Vec::new()),
             audits: RwLock::new(Vec::new()),
+            alert_deliveries: RwLock::new(Vec::new()),
             inspections: RwLock::new(Vec::new()),
+            quota_snapshots: RwLock::new(HashMap::new()),
             probe_leases: RwLock::new(HashMap::new()),
             refresh_leases: RwLock::new(HashMap::new()),
         };
@@ -443,41 +494,52 @@ impl InMemoryPlatformStore {
         &self,
         _tenant_id: Uuid,
     ) -> Result<Vec<ModelDescriptor>, StoreError> {
-        let route_groups = self.inner.route_groups.read().await;
-        let bindings = self.inner.route_group_bindings.read().await;
         let accounts = self.inner.provider_accounts.read().await;
+        let route_groups = self.inner.route_groups.read().await;
+        let mut active_models = BTreeMap::new();
 
-        Ok(route_groups
-            .values()
-            .filter(|route_group| {
-                bindings.values().any(|binding| {
-                    if binding.route_group_id != route_group.id {
-                        return false;
-                    }
+        for account in accounts.values() {
+            if account.state != AccountState::Active {
+                continue;
+            }
 
-                    accounts
-                        .get(&binding.provider_account_id)
-                        .map(|account| {
-                            account.provider == route_group.provider_kind
-                                && account
-                                    .capabilities
-                                    .iter()
-                                    .any(|model| model == &route_group.upstream_model)
-                        })
-                        .unwrap_or(false)
-                })
-            })
-            .map(|route_group| ModelDescriptor {
-                id: route_group.public_model.clone(),
-                route_group: route_group.slug.clone(),
-                provider_kind: route_group.provider_kind.clone(),
-                upstream_model: route_group.upstream_model.clone(),
-                capabilities: vec![
-                    ModelCapability::Chat,
-                    ModelCapability::Responses,
-                    ModelCapability::Streaming,
-                    ModelCapability::Tools,
-                ],
+            for model_id in &account.capabilities {
+                active_models
+                    .entry(model_id.clone())
+                    .or_insert_with(|| account.provider.clone());
+            }
+        }
+
+        Ok(active_models
+            .into_iter()
+            .map(|(model_id, provider_kind)| {
+                route_groups
+                    .values()
+                    .find(|route_group| {
+                        route_group.public_model == model_id
+                            && route_group.provider_kind == provider_kind
+                    })
+                    .or_else(|| {
+                        route_groups
+                            .values()
+                            .find(|route_group| route_group.public_model == model_id)
+                    })
+                    .map_or_else(
+                        || ModelDescriptor {
+                            id: model_id.clone(),
+                            route_group: derive_route_group_slug(&provider_kind, &model_id),
+                            provider_kind: provider_kind.clone(),
+                            upstream_model: model_id.clone(),
+                            capabilities: default_model_capabilities(),
+                        },
+                        |route_group| ModelDescriptor {
+                            id: route_group.public_model.clone(),
+                            route_group: route_group.slug.clone(),
+                            provider_kind: route_group.provider_kind.clone(),
+                            upstream_model: route_group.upstream_model.clone(),
+                            capabilities: default_model_capabilities(),
+                        },
+                    )
             })
             .collect())
     }
@@ -570,6 +632,44 @@ impl InMemoryPlatformStore {
         Ok(self.inner.audits.read().await.clone())
     }
 
+    pub async fn record_alert_delivery(
+        &self,
+        alert_id: Uuid,
+        destination: impl Into<String>,
+    ) -> Result<bool, StoreError> {
+        let destination = destination.into();
+        let mut deliveries = self.inner.alert_deliveries.write().await;
+        if deliveries
+            .iter()
+            .any(|receipt| receipt.alert_id == alert_id && receipt.destination == destination)
+        {
+            return Ok(false);
+        }
+
+        deliveries.push(AlertDeliveryReceipt {
+            id: Uuid::new_v4(),
+            alert_id,
+            destination,
+            delivered_at: Utc::now(),
+        });
+        Ok(true)
+    }
+
+    pub async fn list_alert_delivery_receipts(
+        &self,
+        destination: &str,
+    ) -> Result<Vec<AlertDeliveryReceipt>, StoreError> {
+        Ok(self
+            .inner
+            .alert_deliveries
+            .read()
+            .await
+            .iter()
+            .filter(|receipt| receipt.destination == destination)
+            .cloned()
+            .collect())
+    }
+
     pub async fn list_provider_accounts(&self) -> Result<Vec<ProviderAccountRecord>, StoreError> {
         Ok(self
             .inner
@@ -637,6 +737,39 @@ impl InMemoryPlatformStore {
                 .then_with(|| right.id.cmp(&left.id))
         });
         Ok(inspections)
+    }
+
+    pub async fn upsert_provider_account_quota_snapshot(
+        &self,
+        provider_account_id: Uuid,
+        snapshot: QuotaSnapshot,
+    ) -> Result<ProviderAccountQuotaSnapshotRecord, StoreError> {
+        let record = ProviderAccountQuotaSnapshotRecord {
+            provider_account_id,
+            plan_label: snapshot.plan_label,
+            remaining_requests_hint: snapshot.remaining_requests_hint,
+            details: snapshot.details.unwrap_or_else(|| json!({})),
+            checked_at: snapshot.checked_at,
+        };
+        self.inner
+            .quota_snapshots
+            .write()
+            .await
+            .insert(provider_account_id, record.clone());
+        Ok(record)
+    }
+
+    pub async fn provider_account_quota_snapshot(
+        &self,
+        provider_account_id: Uuid,
+    ) -> Result<Option<ProviderAccountQuotaSnapshotRecord>, StoreError> {
+        Ok(self
+            .inner
+            .quota_snapshots
+            .read()
+            .await
+            .get(&provider_account_id)
+            .cloned())
     }
 
     pub async fn provider_account_envelope(
@@ -721,6 +854,10 @@ impl InMemoryPlatformStore {
             .write()
             .await
             .insert(record.id, credentials);
+        for model_id in &record.capabilities {
+            self.ensure_route_group_and_binding(&record.provider, model_id, record.id)
+                .await?;
+        }
 
         Ok(record)
     }
@@ -754,7 +891,16 @@ impl InMemoryPlatformStore {
             runtime.consecutive_failures = 0;
         }
 
-        Ok(Some(record.clone()))
+        let provider_kind = record.provider.clone();
+        let capability_ids = record.capabilities.clone();
+        let updated_record = record.clone();
+        drop(accounts);
+        for model_id in &capability_ids {
+            self.ensure_route_group_and_binding(&provider_kind, model_id, account_id)
+                .await?;
+        }
+
+        Ok(Some(updated_record))
     }
 
     pub async fn rotate_provider_account_secret(
@@ -810,32 +956,85 @@ impl InMemoryPlatformStore {
         provider_kind: String,
         upstream_model: String,
     ) -> Result<RouteGroupRecord, StoreError> {
-        let slug = public_model.replace('.', "-");
-        let record = RouteGroupRecord {
-            id: Uuid::new_v4(),
-            slug,
-            public_model,
-            provider_kind,
-            upstream_model,
-            created_at: Utc::now(),
+        let mut route_groups = self.inner.route_groups.write().await;
+        let slug = derive_route_group_slug(&provider_kind, &public_model);
+        let record = if let Some(existing) = route_groups.values_mut().find(|route_group| {
+            route_group.public_model == public_model && route_group.provider_kind == provider_kind
+        }) {
+            existing.slug = slug;
+            existing.upstream_model = upstream_model;
+            existing.clone()
+        } else {
+            let record = RouteGroupRecord {
+                id: Uuid::new_v4(),
+                slug,
+                public_model,
+                provider_kind,
+                upstream_model,
+                created_at: Utc::now(),
+            };
+            route_groups.insert(record.id, record.clone());
+            record
         };
-        self.inner
-            .route_groups
-            .write()
-            .await
-            .insert(record.id, record.clone());
         Ok(record)
     }
 
+    pub async fn ensure_route_group_and_binding(
+        &self,
+        provider_kind: &str,
+        upstream_model: &str,
+        account_id: Uuid,
+    ) -> Result<(), StoreError> {
+        let mut route_groups = self.inner.route_groups.write().await;
+        let mut runtimes = self.inner.runtimes.write().await;
+        let mut bindings = self.inner.route_group_bindings.write().await;
+        ensure_route_group_and_binding_in_maps(
+            &mut route_groups,
+            &mut bindings,
+            &mut runtimes,
+            provider_kind,
+            upstream_model,
+            account_id,
+        );
+        Ok(())
+    }
+
     pub async fn list_route_groups(&self) -> Result<Vec<RouteGroupRecord>, StoreError> {
-        Ok(self
+        let mut route_groups = self
             .inner
             .route_groups
             .read()
             .await
             .values()
             .cloned()
-            .collect())
+            .collect::<Vec<_>>();
+        route_groups.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        Ok(route_groups)
+    }
+
+    pub async fn list_route_group_bindings(
+        &self,
+    ) -> Result<Vec<RouteGroupBindingRecord>, StoreError> {
+        let mut bindings = self
+            .inner
+            .route_group_bindings
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        bindings.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        Ok(bindings)
     }
 
     pub async fn bind_provider_account(
@@ -876,11 +1075,17 @@ impl InMemoryPlatformStore {
             .entry(provider_account_id)
             .and_modify(|runtime| runtime.max_in_flight = max_in_flight)
             .or_insert_with(|| AccountRuntime::new(AccountState::Active, max_in_flight));
-        self.inner
-            .route_group_bindings
-            .write()
-            .await
-            .insert(record.id, record.clone());
+        let mut bindings = self.inner.route_group_bindings.write().await;
+        if let Some(existing) = bindings.values_mut().find(|binding| {
+            binding.route_group_id == route_group_id
+                && binding.provider_account_id == provider_account_id
+        }) {
+            existing.weight = weight;
+            existing.max_in_flight = max_in_flight;
+            return Ok(existing.clone());
+        }
+
+        bindings.insert(record.id, record.clone());
         Ok(record)
     }
 
@@ -1102,6 +1307,7 @@ impl InMemoryPlatformStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use protocol_core::{ModelCapability, ModelDescriptor};
     use provider_core::{AccountCapabilities, ProviderAccountEnvelope, ValidatedProviderAccount};
 
     #[tokio::test]
@@ -1199,6 +1405,265 @@ mod tests {
             .expect("ingest");
 
         assert_eq!(record.state, AccountState::Active);
+    }
+
+    #[tokio::test]
+    async fn ingest_provider_account_auto_creates_route_group_and_binding() {
+        let store = InMemoryPlatformStore::empty();
+        let record = store
+            .ingest_provider_account(
+                ProviderAccountEnvelope {
+                    provider: "openai_codex".to_string(),
+                    credential_kind: "oauth_tokens".to_string(),
+                    payload_version: "v1".to_string(),
+                    credentials: json!({"access_token":"token"}),
+                    metadata: json!({}),
+                    labels: vec![],
+                    tags: BTreeMap::new(),
+                },
+                ValidatedProviderAccount {
+                    provider_account_id: "acct_auto".to_string(),
+                    redacted_display: Some("a***@***".to_string()),
+                    expires_at: None,
+                },
+                AccountCapabilities {
+                    models: vec![ModelDescriptor {
+                        id: "gpt-4.1-mini".to_string(),
+                        route_group: "gpt-4.1-mini".to_string(),
+                        provider_kind: "openai_codex".to_string(),
+                        upstream_model: "gpt-4.1-mini".to_string(),
+                        capabilities: vec![
+                            ModelCapability::Chat,
+                            ModelCapability::Responses,
+                            ModelCapability::Streaming,
+                        ],
+                    }],
+                    supports_refresh: true,
+                    supports_quota_probe: false,
+                },
+            )
+            .await
+            .expect("ingest");
+
+        let route_groups = store.list_route_groups().await.expect("route groups");
+        assert!(route_groups.iter().any(|route_group| {
+            route_group.public_model == "gpt-4.1-mini"
+                && route_group.provider_kind == "openai_codex"
+                && route_group.upstream_model == "gpt-4.1-mini"
+        }));
+
+        let candidates = store
+            .scheduler_candidates("gpt-4.1-mini")
+            .await
+            .expect("scheduler candidates");
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.account_id == record.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn revalidate_provider_account_auto_creates_route_group_for_new_capability() {
+        let store = InMemoryPlatformStore::empty();
+        let record = store
+            .ingest_provider_account(
+                ProviderAccountEnvelope {
+                    provider: "openai_codex".to_string(),
+                    credential_kind: "oauth_tokens".to_string(),
+                    payload_version: "v1".to_string(),
+                    credentials: json!({"access_token":"token"}),
+                    metadata: json!({}),
+                    labels: vec![],
+                    tags: BTreeMap::new(),
+                },
+                ValidatedProviderAccount {
+                    provider_account_id: "acct_auto".to_string(),
+                    redacted_display: Some("a***@***".to_string()),
+                    expires_at: None,
+                },
+                AccountCapabilities {
+                    models: vec![ModelDescriptor {
+                        id: "gpt-4.1-mini".to_string(),
+                        route_group: "gpt-4.1-mini".to_string(),
+                        provider_kind: "openai_codex".to_string(),
+                        upstream_model: "gpt-4.1-mini".to_string(),
+                        capabilities: vec![ModelCapability::Chat],
+                    }],
+                    supports_refresh: true,
+                    supports_quota_probe: false,
+                },
+            )
+            .await
+            .expect("ingest");
+
+        store
+            .revalidate_provider_account(
+                record.id,
+                ValidatedProviderAccount {
+                    provider_account_id: "acct_auto".to_string(),
+                    redacted_display: Some("a***@***".to_string()),
+                    expires_at: None,
+                },
+                AccountCapabilities {
+                    models: vec![
+                        ModelDescriptor {
+                            id: "gpt-4.1-mini".to_string(),
+                            route_group: "gpt-4.1-mini".to_string(),
+                            provider_kind: "openai_codex".to_string(),
+                            upstream_model: "gpt-4.1-mini".to_string(),
+                            capabilities: vec![ModelCapability::Chat],
+                        },
+                        ModelDescriptor {
+                            id: "codex-mini-latest".to_string(),
+                            route_group: "codex-mini-latest".to_string(),
+                            provider_kind: "openai_codex".to_string(),
+                            upstream_model: "codex-mini-latest".to_string(),
+                            capabilities: vec![ModelCapability::Responses],
+                        },
+                    ],
+                    supports_refresh: true,
+                    supports_quota_probe: false,
+                },
+            )
+            .await
+            .expect("revalidate")
+            .expect("record");
+
+        let route_groups = store.list_route_groups().await.expect("route groups");
+        assert!(route_groups.iter().any(|route_group| {
+            route_group.public_model == "codex-mini-latest"
+                && route_group.provider_kind == "openai_codex"
+        }));
+    }
+
+    #[tokio::test]
+    async fn list_tenant_models_aggregates_active_capabilities_without_duplicates() {
+        let store = InMemoryPlatformStore::empty();
+        let tenant_id = store
+            .create_tenant("demo".to_string(), "Demo".to_string())
+            .await
+            .expect("tenant")
+            .id;
+
+        let first = store
+            .ingest_provider_account(
+                ProviderAccountEnvelope {
+                    provider: "openai_codex".to_string(),
+                    credential_kind: "oauth_tokens".to_string(),
+                    payload_version: "v1".to_string(),
+                    credentials: json!({"access_token":"token-a"}),
+                    metadata: json!({}),
+                    labels: vec![],
+                    tags: BTreeMap::new(),
+                },
+                ValidatedProviderAccount {
+                    provider_account_id: "acct_a".to_string(),
+                    redacted_display: None,
+                    expires_at: None,
+                },
+                AccountCapabilities {
+                    models: vec![ModelDescriptor {
+                        id: "gpt-4.1-mini".to_string(),
+                        route_group: "gpt-4.1-mini".to_string(),
+                        provider_kind: "openai_codex".to_string(),
+                        upstream_model: "gpt-4.1-mini".to_string(),
+                        capabilities: vec![ModelCapability::Chat],
+                    }],
+                    supports_refresh: true,
+                    supports_quota_probe: false,
+                },
+            )
+            .await
+            .expect("first account");
+        store
+            .ingest_provider_account(
+                ProviderAccountEnvelope {
+                    provider: "openai_codex".to_string(),
+                    credential_kind: "oauth_tokens".to_string(),
+                    payload_version: "v1".to_string(),
+                    credentials: json!({"access_token":"token-b"}),
+                    metadata: json!({}),
+                    labels: vec![],
+                    tags: BTreeMap::new(),
+                },
+                ValidatedProviderAccount {
+                    provider_account_id: "acct_b".to_string(),
+                    redacted_display: None,
+                    expires_at: None,
+                },
+                AccountCapabilities {
+                    models: vec![ModelDescriptor {
+                        id: "gpt-4.1-mini".to_string(),
+                        route_group: "gpt-4.1-mini".to_string(),
+                        provider_kind: "openai_codex".to_string(),
+                        upstream_model: "gpt-4.1-mini".to_string(),
+                        capabilities: vec![ModelCapability::Chat],
+                    }],
+                    supports_refresh: true,
+                    supports_quota_probe: false,
+                },
+            )
+            .await
+            .expect("second account");
+        let inactive = store
+            .ingest_provider_account(
+                ProviderAccountEnvelope {
+                    provider: "openai_codex".to_string(),
+                    credential_kind: "oauth_tokens".to_string(),
+                    payload_version: "v1".to_string(),
+                    credentials: json!({"access_token":"token-c"}),
+                    metadata: json!({}),
+                    labels: vec![],
+                    tags: BTreeMap::new(),
+                },
+                ValidatedProviderAccount {
+                    provider_account_id: "acct_c".to_string(),
+                    redacted_display: None,
+                    expires_at: None,
+                },
+                AccountCapabilities {
+                    models: vec![ModelDescriptor {
+                        id: "gpt-5".to_string(),
+                        route_group: "gpt-5".to_string(),
+                        provider_kind: "openai_codex".to_string(),
+                        upstream_model: "gpt-5".to_string(),
+                        capabilities: vec![ModelCapability::Chat],
+                    }],
+                    supports_refresh: true,
+                    supports_quota_probe: false,
+                },
+            )
+            .await
+            .expect("inactive account");
+        store
+            .set_provider_account_state(inactive.id, AccountState::Disabled)
+            .await
+            .expect("state change");
+
+        let models = store
+            .list_tenant_models(tenant_id)
+            .await
+            .expect("tenant models");
+        assert_eq!(
+            models
+                .iter()
+                .filter(|model| model.id == "gpt-4.1-mini")
+                .count(),
+            1
+        );
+        assert!(models.iter().any(|model| model.id == "gpt-4.1-mini"));
+        assert!(models.iter().all(|model| model.id != "gpt-5"));
+
+        let candidates = store
+            .scheduler_candidates("gpt-4.1-mini")
+            .await
+            .expect("candidates");
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.account_id == first.id)
+        );
     }
 
     #[tokio::test]

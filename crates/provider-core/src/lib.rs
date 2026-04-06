@@ -42,6 +42,8 @@ pub struct AccountCapabilities {
 pub struct QuotaSnapshot {
     pub plan_label: Option<String>,
     pub remaining_requests_hint: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<Value>,
     pub checked_at: DateTime<Utc>,
 }
 
@@ -144,6 +146,7 @@ pub trait ProviderAdapter: Send + Sync {
 
     async fn probe_quota(
         &self,
+        _envelope: &ProviderAccountEnvelope,
         account: &ValidatedProviderAccount,
     ) -> Result<QuotaSnapshot, ProviderError>;
 
@@ -256,11 +259,13 @@ mod tests {
 
         async fn probe_quota(
             &self,
+            _envelope: &ProviderAccountEnvelope,
             _account: &ValidatedProviderAccount,
         ) -> Result<QuotaSnapshot, ProviderError> {
             Ok(QuotaSnapshot {
                 plan_label: Some("demo".to_string()),
                 remaining_requests_hint: Some(10),
+                details: None,
                 checked_at: Utc::now(),
             })
         }

@@ -3,10 +3,11 @@ mod postgres;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use protocol_core::{ModelDescriptor, TokenUsage};
+use protocol_core::{ModelCapability, ModelDescriptor, TokenUsage};
 use provider_core::{
     AccountCapabilities, ProviderAccountEnvelope, ProviderConnectionInfo,
-    ProviderCredentialResolver, ProviderError, ProviderErrorKind, ValidatedProviderAccount,
+    ProviderCredentialResolver, ProviderError, ProviderErrorKind, QuotaSnapshot,
+    ValidatedProviderAccount,
 };
 use scheduler::{AccountState, ProviderAccountCandidate, ProviderOutcome};
 use serde::{Deserialize, Serialize};
@@ -158,6 +159,15 @@ pub struct AccountInspectionRecord {
     pub inspected_at: DateTime<Utc>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ProviderAccountQuotaSnapshotRecord {
+    pub provider_account_id: Uuid,
+    pub plan_label: Option<String>,
+    pub remaining_requests_hint: Option<u64>,
+    pub details: Value,
+    pub checked_at: DateTime<Utc>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProbeDispatchLease {
     pub lease_id: Uuid,
@@ -172,6 +182,14 @@ pub struct RefreshDispatchLease {
     pub account_id: Uuid,
     pub leased_at: DateTime<Utc>,
     pub leased_until: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AlertDeliveryReceipt {
+    pub id: Uuid,
+    pub alert_id: Uuid,
+    pub destination: String,
+    pub delivered_at: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -473,6 +491,27 @@ impl PlatformStore {
         }
     }
 
+    pub async fn record_alert_delivery(
+        &self,
+        alert_id: Uuid,
+        destination: impl Into<String>,
+    ) -> Result<bool, StoreError> {
+        match self {
+            Self::InMemory(store) => store.record_alert_delivery(alert_id, destination).await,
+            Self::Postgres(store) => store.record_alert_delivery(alert_id, destination).await,
+        }
+    }
+
+    pub async fn list_alert_delivery_receipts(
+        &self,
+        destination: &str,
+    ) -> Result<Vec<AlertDeliveryReceipt>, StoreError> {
+        match self {
+            Self::InMemory(store) => store.list_alert_delivery_receipts(destination).await,
+            Self::Postgres(store) => store.list_alert_delivery_receipts(destination).await,
+        }
+    }
+
     pub async fn provider_account(
         &self,
         account_id: Uuid,
@@ -528,6 +567,43 @@ impl PlatformStore {
         match self {
             Self::InMemory(store) => store.list_account_inspections(provider_account_id).await,
             Self::Postgres(store) => store.list_account_inspections(provider_account_id).await,
+        }
+    }
+
+    pub async fn upsert_provider_account_quota_snapshot(
+        &self,
+        provider_account_id: Uuid,
+        snapshot: QuotaSnapshot,
+    ) -> Result<ProviderAccountQuotaSnapshotRecord, StoreError> {
+        match self {
+            Self::InMemory(store) => {
+                store
+                    .upsert_provider_account_quota_snapshot(provider_account_id, snapshot)
+                    .await
+            }
+            Self::Postgres(store) => {
+                store
+                    .upsert_provider_account_quota_snapshot(provider_account_id, snapshot)
+                    .await
+            }
+        }
+    }
+
+    pub async fn provider_account_quota_snapshot(
+        &self,
+        provider_account_id: Uuid,
+    ) -> Result<Option<ProviderAccountQuotaSnapshotRecord>, StoreError> {
+        match self {
+            Self::InMemory(store) => {
+                store
+                    .provider_account_quota_snapshot(provider_account_id)
+                    .await
+            }
+            Self::Postgres(store) => {
+                store
+                    .provider_account_quota_snapshot(provider_account_id)
+                    .await
+            }
         }
     }
 
@@ -632,10 +708,39 @@ impl PlatformStore {
         }
     }
 
+    pub async fn ensure_route_group_and_binding(
+        &self,
+        provider_kind: &str,
+        upstream_model: &str,
+        account_id: Uuid,
+    ) -> Result<(), StoreError> {
+        match self {
+            Self::InMemory(store) => {
+                store
+                    .ensure_route_group_and_binding(provider_kind, upstream_model, account_id)
+                    .await
+            }
+            Self::Postgres(store) => {
+                store
+                    .ensure_route_group_and_binding(provider_kind, upstream_model, account_id)
+                    .await
+            }
+        }
+    }
+
     pub async fn list_route_groups(&self) -> Result<Vec<RouteGroupRecord>, StoreError> {
         match self {
             Self::InMemory(store) => store.list_route_groups().await,
             Self::Postgres(store) => store.list_route_groups().await,
+        }
+    }
+
+    pub async fn list_route_group_bindings(
+        &self,
+    ) -> Result<Vec<RouteGroupBindingRecord>, StoreError> {
+        match self {
+            Self::InMemory(store) => store.list_route_group_bindings().await,
+            Self::Postgres(store) => store.list_route_group_bindings().await,
         }
     }
 
@@ -852,6 +957,37 @@ pub(crate) fn provider_connection_from_parts(
         model_override,
         additional_headers,
     })
+}
+
+pub(crate) fn default_model_capabilities() -> Vec<ModelCapability> {
+    vec![
+        ModelCapability::Chat,
+        ModelCapability::Responses,
+        ModelCapability::Streaming,
+        ModelCapability::Tools,
+    ]
+}
+
+pub(crate) fn derive_route_group_slug(provider_kind: &str, public_model: &str) -> String {
+    let combined = format!("{provider_kind}-{public_model}");
+    let mut slug = String::with_capacity(combined.len());
+    let mut previous_was_dash = false;
+
+    for character in combined.chars() {
+        let normalized = if character.is_ascii_alphanumeric() {
+            previous_was_dash = false;
+            character.to_ascii_lowercase()
+        } else {
+            if previous_was_dash {
+                continue;
+            }
+            previous_was_dash = true;
+            '-'
+        };
+        slug.push(normalized);
+    }
+
+    slug.trim_matches('-').to_string()
 }
 
 fn extract_header_map(value: Option<&Value>) -> BTreeMap<String, String> {

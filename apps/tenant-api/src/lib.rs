@@ -2,7 +2,7 @@ use anyhow::Result;
 use axum::{
     Router,
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Json, Response},
     routing::{get, post},
 };
@@ -10,6 +10,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::net::SocketAddr;
 use storage::{AuthError, PlatformStore, TenantManagementPrincipal};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::info;
 use uuid::Uuid;
 
@@ -28,7 +29,7 @@ impl TenantApiState {
 }
 
 pub fn app(state: TenantApiState) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/tenant/v1/me", get(me))
         .route("/tenant/v1/models", get(models))
         .route(
@@ -40,7 +41,13 @@ pub fn app(state: TenantApiState) -> Router {
         .route("/tenant/v1/usage", get(usage))
         .route("/tenant/v1/requests", get(requests))
         .route("/tenant/v1/limits", get(limits))
-        .with_state(state)
+        .with_state(state);
+
+    if let Some(layer) = tenant_api_cors_layer() {
+        router.layer(layer)
+    } else {
+        router
+    }
 }
 
 pub async fn run(addr: SocketAddr, state: TenantApiState) -> Result<()> {
@@ -220,6 +227,28 @@ fn auth_error_response(error: AuthError) -> Response {
     }
 }
 
+fn tenant_api_cors_layer() -> Option<CorsLayer> {
+    let allowed_origins = std::env::var("FERRUMGATE_TENANT_API_ALLOWED_ORIGINS").ok()?;
+    let origins = allowed_origins
+        .split(',')
+        .map(str::trim)
+        .filter(|origin| !origin.is_empty())
+        .map(HeaderValue::from_str)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+
+    if origins.is_empty() {
+        return None;
+    }
+
+    Some(
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::list(origins))
+            .allow_methods([Method::GET, Method::POST])
+            .allow_headers([http::header::AUTHORIZATION, http::header::CONTENT_TYPE]),
+    )
+}
+
 trait ResponseExt {
     fn with_status(self, status: StatusCode) -> Response;
 }
@@ -241,9 +270,15 @@ mod tests {
     use super::*;
     use axum::{
         body::{Body, to_bytes},
-        http::Request,
+        http::{Request, header},
     };
+    use std::sync::{Mutex, OnceLock};
     use tower::util::ServiceExt;
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[tokio::test]
     async fn tenant_admin_can_create_api_key() {
@@ -266,5 +301,185 @@ mod tests {
             .await
             .expect("body");
         assert!(String::from_utf8_lossy(&body).contains("fgk_"));
+    }
+
+    #[tokio::test]
+    async fn tenant_admin_can_read_tenant_profile() {
+        let app = app(TenantApiState::demo());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/tenant/v1/me")
+                    .header(http::header::AUTHORIZATION, "Bearer fg_tenant_admin_demo")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert!(String::from_utf8_lossy(&body).contains("demo-tenant"));
+    }
+
+    #[tokio::test]
+    async fn tenant_admin_can_list_rotate_and_revoke_api_keys() {
+        let app = app(TenantApiState::demo());
+
+        let created = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/tenant/v1/api-keys")
+                    .header(http::header::AUTHORIZATION, "Bearer fg_tenant_admin_demo")
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"label":"sdk"}"#))
+                    .expect("create request"),
+            )
+            .await
+            .expect("create response");
+        assert_eq!(created.status(), StatusCode::OK);
+        let created_body = to_bytes(created.into_body(), usize::MAX)
+            .await
+            .expect("create body");
+        let created_json: Value = serde_json::from_slice(&created_body).expect("create json");
+        let api_key_id = created_json["record"]["id"]
+            .as_str()
+            .expect("api key id")
+            .to_string();
+
+        let listed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/tenant/v1/api-keys")
+                    .header(http::header::AUTHORIZATION, "Bearer fg_tenant_admin_demo")
+                    .body(Body::empty())
+                    .expect("list request"),
+            )
+            .await
+            .expect("list response");
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed_body = to_bytes(listed.into_body(), usize::MAX)
+            .await
+            .expect("list body");
+        assert!(String::from_utf8_lossy(&listed_body).contains("sdk"));
+
+        let rotated = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/tenant/v1/api-keys/{api_key_id}/rotate"))
+                    .header(http::header::AUTHORIZATION, "Bearer fg_tenant_admin_demo")
+                    .body(Body::empty())
+                    .expect("rotate request"),
+            )
+            .await
+            .expect("rotate response");
+        assert_eq!(rotated.status(), StatusCode::OK);
+        let rotated_body = to_bytes(rotated.into_body(), usize::MAX)
+            .await
+            .expect("rotate body");
+        assert!(String::from_utf8_lossy(&rotated_body).contains("fgk_"));
+
+        let revoked = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/tenant/v1/api-keys/{api_key_id}/revoke"))
+                    .header(http::header::AUTHORIZATION, "Bearer fg_tenant_admin_demo")
+                    .body(Body::empty())
+                    .expect("revoke request"),
+            )
+            .await
+            .expect("revoke response");
+        assert_eq!(revoked.status(), StatusCode::OK);
+        let revoked_body = to_bytes(revoked.into_body(), usize::MAX)
+            .await
+            .expect("revoke body");
+        assert!(String::from_utf8_lossy(&revoked_body).contains("revoked"));
+    }
+
+    #[tokio::test]
+    async fn cors_preflight_allows_explicit_origin() {
+        let _guard = env_lock().lock().expect("env lock");
+        unsafe {
+            std::env::set_var(
+                "FERRUMGATE_TENANT_API_ALLOWED_ORIGINS",
+                "http://127.0.0.1:5173",
+            );
+        }
+
+        let app = app(TenantApiState::demo());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/tenant/v1/me")
+                    .header(header::ORIGIN, "http://127.0.0.1:5173")
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                    .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "authorization")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|value| value.to_str().ok()),
+            Some("http://127.0.0.1:5173")
+        );
+
+        unsafe {
+            std::env::remove_var("FERRUMGATE_TENANT_API_ALLOWED_ORIGINS");
+        }
+    }
+
+    #[tokio::test]
+    async fn cors_preflight_does_not_allow_unconfigured_origin() {
+        let _guard = env_lock().lock().expect("env lock");
+        unsafe {
+            std::env::set_var(
+                "FERRUMGATE_TENANT_API_ALLOWED_ORIGINS",
+                "http://127.0.0.1:5173",
+            );
+        }
+
+        let app = app(TenantApiState::demo());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/tenant/v1/me")
+                    .header(header::ORIGIN, "http://127.0.0.1:4173")
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                    .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "authorization")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_ne!(
+            response
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|value| value.to_str().ok()),
+            Some("http://127.0.0.1:4173")
+        );
+
+        unsafe {
+            std::env::remove_var("FERRUMGATE_TENANT_API_ALLOWED_ORIGINS");
+        }
     }
 }

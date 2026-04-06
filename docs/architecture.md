@@ -14,6 +14,8 @@ This keeps future Anthropic support isolated to a new frontend module.
 
 - Smallest scheduling unit: `provider account`
 - Routing model: `public model -> route group -> provider account bindings`
+- Route groups and bindings are auto-derived from validated `provider account capabilities`
+- Manual route-group and binding APIs remain available only as advanced overrides
 - State machine: `pending_validation`, `active`, `cooling`, `draining`, `quota_exhausted`, `invalid_credentials`, `disabled`
 - Runtime policy: health first, weight second, least-recently-used third
 
@@ -37,7 +39,9 @@ This keeps future Anthropic support isolated to a new frontend module.
 
 - Imports provider credentials through a provider-specific envelope
 - Validates and probes accounts via the provider registry
-- Manages route groups, bindings and tenants
+- Auto-creates route groups and bindings for each discovered upstream model
+- Exposes routing overview data for the console while keeping manual override APIs available
+- Manages tenants and API access
 - Enforces RBAC using roles plus resource scopes
 - Records audit events for sensitive actions
 
@@ -46,4 +50,4 @@ This keeps future Anthropic support isolated to a new frontend module.
 - Postgres: tenants, API keys, provider accounts, secret versions, route groups, bindings, RBAC, audit events, usage ledger
 - Redis: cooldown windows, circuit breaker windows, distributed leases, in-flight counters, short queue state
 
-The current milestone keeps runtime state in memory to preserve fast iteration while the schema and API boundaries settle.
+The current milestone keeps runtime state in memory for the demo backend while Postgres stores account runtime, quota snapshots, and the auto-derived routing graph.

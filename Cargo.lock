@@ -377,6 +377,7 @@ dependencies = [
  "protocol-core",
  "provider-core",
  "provider-openai-codex",
+ "reqwest 0.12.28",
  "scheduler",
  "serde",
  "serde_json",

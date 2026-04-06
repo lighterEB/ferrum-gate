@@ -1,19 +1,21 @@
 use crate::{
-    AccountInspectionRecord, AccountInspectionStatus, AuditEvent, AuthError, CreatedApiKey,
-    GatewayAuthContext, Permission, ProbeDispatchLease, ProviderAccountCandidate,
-    ProviderAccountRecord, RefreshDispatchLease, RequestRecord, Role, RouteGroupBindingRecord,
-    RouteGroupRecord, ScopeTarget, ServiceAccountPrincipal, StoreError, Tenant, TenantApiKeyStatus,
-    TenantApiKeyView, TenantManagementPrincipal, UsageSummary, provider_connection_from_parts,
-    role_allows, scope_allows,
+    AccountInspectionRecord, AccountInspectionStatus, AlertDeliveryReceipt, AuditEvent, AuthError,
+    CreatedApiKey, GatewayAuthContext, Permission, ProbeDispatchLease, ProviderAccountCandidate,
+    ProviderAccountQuotaSnapshotRecord, ProviderAccountRecord, RefreshDispatchLease, RequestRecord,
+    Role, RouteGroupBindingRecord, RouteGroupRecord, ScopeTarget, ServiceAccountPrincipal,
+    StoreError, Tenant, TenantApiKeyStatus, TenantApiKeyView, TenantManagementPrincipal,
+    UsageSummary, default_model_capabilities, derive_route_group_slug,
+    provider_connection_from_parts, role_allows, scope_allows,
 };
 use aes_gcm::{
     Aes256Gcm, Nonce,
     aead::{Aead, KeyInit},
 };
 use chrono::{TimeDelta, Utc};
-use protocol_core::{ModelCapability, ModelDescriptor, TokenUsage};
+use protocol_core::{ModelDescriptor, TokenUsage};
 use provider_core::{
-    AccountCapabilities, ProviderAccountEnvelope, ProviderConnectionInfo, ValidatedProviderAccount,
+    AccountCapabilities, ProviderAccountEnvelope, ProviderConnectionInfo, QuotaSnapshot,
+    ValidatedProviderAccount,
 };
 use rand::RngCore;
 use scheduler::{AccountRuntime, AccountState, ProviderOutcome, select_candidate};
@@ -28,10 +30,8 @@ use std::{collections::BTreeMap, env};
 use uuid::Uuid;
 
 const DEFAULT_MASTER_KEY: &str = "ferrum-gate-development-master-key";
-const DEMO_ROUTE_GROUP_ID: &str = "00000000-0000-0000-0000-000000000101";
 const DEMO_PROVIDER_ACCOUNT_ID: &str = "00000000-0000-0000-0000-000000000201";
 const DEMO_API_KEY_ID: &str = "00000000-0000-0000-0000-000000000301";
-const DEMO_BINDING_ID: &str = "00000000-0000-0000-0000-000000000401";
 const DEMO_TENANT_ID: &str = "00000000-0000-0000-0000-000000000001";
 
 #[derive(Clone)]
@@ -94,10 +94,8 @@ impl PostgresPlatformStore {
         }
 
         let tenant_id = Uuid::parse_str(DEMO_TENANT_ID).expect("uuid");
-        let route_group_id = Uuid::parse_str(DEMO_ROUTE_GROUP_ID).expect("uuid");
         let provider_account_id = Uuid::parse_str(DEMO_PROVIDER_ACCOUNT_ID).expect("uuid");
         let api_key_id = Uuid::parse_str(DEMO_API_KEY_ID).expect("uuid");
-        let binding_id = Uuid::parse_str(DEMO_BINDING_ID).expect("uuid");
         let secret_version_id = Uuid::new_v4();
         let now = Utc::now();
 
@@ -218,33 +216,10 @@ impl PostgresPlatformStore {
         .await
         .map_err(store_backend_error)?;
 
-        sqlx::query(
-            "insert into route_groups
-             (id, slug, public_model, provider_kind, upstream_model, created_at)
-             values ($1, $2, $3, $4, $5, $6)",
-        )
-        .bind(route_group_id)
-        .bind("openai-gpt-4-1-mini")
-        .bind("gpt-4.1-mini")
-        .bind("openai_codex")
-        .bind("gpt-4.1-mini")
-        .bind(now)
-        .execute(&self.pool)
-        .await
-        .map_err(store_backend_error)?;
-
-        sqlx::query(
-            "insert into route_group_bindings
-             (id, route_group_id, provider_account_id, weight, max_in_flight, created_at)
-             values ($1, $2, $3, 100, 16, $4)",
-        )
-        .bind(binding_id)
-        .bind(route_group_id)
-        .bind(provider_account_id)
-        .bind(now)
-        .execute(&self.pool)
-        .await
-        .map_err(store_backend_error)?;
+        for model_id in ["gpt-4.1-mini", "codex-mini-latest"] {
+            self.ensure_route_group_and_binding("openai_codex", model_id, provider_account_id)
+                .await?;
+        }
 
         Ok(())
     }
@@ -490,32 +465,53 @@ impl PostgresPlatformStore {
         &self,
         _tenant_id: Uuid,
     ) -> Result<Vec<ModelDescriptor>, StoreError> {
-        let rows = sqlx::query(
-            "select distinct rg.id, rg.slug, rg.public_model, rg.provider_kind, rg.upstream_model
-             from route_groups rg
-             join route_group_bindings b on b.route_group_id = rg.id
-             join provider_accounts p on p.id = b.provider_account_id
-             where p.provider = rg.provider_kind
-               and p.capabilities ? rg.upstream_model
-             order by rg.id",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(store_backend_error)?;
+        let accounts = self.list_provider_accounts().await?;
+        let route_groups = self.list_route_groups().await?;
+        let mut active_models = BTreeMap::new();
 
-        Ok(rows
+        for account in accounts {
+            if account.state != AccountState::Active {
+                continue;
+            }
+
+            let provider_kind = account.provider.clone();
+            for model_id in account.capabilities {
+                active_models
+                    .entry(model_id)
+                    .or_insert_with(|| provider_kind.clone());
+            }
+        }
+
+        Ok(active_models
             .into_iter()
-            .map(|row| ModelDescriptor {
-                id: row.try_get("public_model").expect("public_model"),
-                route_group: row.try_get("slug").expect("slug"),
-                provider_kind: row.try_get("provider_kind").expect("provider_kind"),
-                upstream_model: row.try_get("upstream_model").expect("upstream_model"),
-                capabilities: vec![
-                    ModelCapability::Chat,
-                    ModelCapability::Responses,
-                    ModelCapability::Streaming,
-                    ModelCapability::Tools,
-                ],
+            .map(|(model_id, provider_kind)| {
+                route_groups
+                    .iter()
+                    .find(|route_group| {
+                        route_group.public_model == model_id
+                            && route_group.provider_kind == provider_kind
+                    })
+                    .or_else(|| {
+                        route_groups
+                            .iter()
+                            .find(|route_group| route_group.public_model == model_id)
+                    })
+                    .map_or_else(
+                        || ModelDescriptor {
+                            id: model_id.clone(),
+                            route_group: derive_route_group_slug(&provider_kind, &model_id),
+                            provider_kind: provider_kind.clone(),
+                            upstream_model: model_id.clone(),
+                            capabilities: default_model_capabilities(),
+                        },
+                        |route_group| ModelDescriptor {
+                            id: route_group.public_model.clone(),
+                            route_group: route_group.slug.clone(),
+                            provider_kind: route_group.provider_kind.clone(),
+                            upstream_model: route_group.upstream_model.clone(),
+                            capabilities: default_model_capabilities(),
+                        },
+                    )
             })
             .collect())
     }
@@ -625,6 +621,45 @@ impl PostgresPlatformStore {
             .collect()
     }
 
+    pub async fn record_alert_delivery(
+        &self,
+        alert_id: Uuid,
+        destination: impl Into<String>,
+    ) -> Result<bool, StoreError> {
+        let result = sqlx::query(
+            "insert into alert_delivery_receipts (id, alert_id, destination, delivered_at)
+             values ($1, $2, $3, $4)
+             on conflict (alert_id, destination) do nothing",
+        )
+        .bind(Uuid::new_v4())
+        .bind(alert_id)
+        .bind(destination.into())
+        .bind(Utc::now())
+        .execute(&self.pool)
+        .await
+        .map_err(store_backend_error)?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn list_alert_delivery_receipts(
+        &self,
+        destination: &str,
+    ) -> Result<Vec<AlertDeliveryReceipt>, StoreError> {
+        let rows = sqlx::query(
+            "select id, alert_id, destination, delivered_at
+             from alert_delivery_receipts
+             where destination = $1
+             order by delivered_at desc",
+        )
+        .bind(destination)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(store_backend_error)?;
+        rows.into_iter()
+            .map(|row| alert_delivery_receipt_from_row(&row))
+            .collect()
+    }
+
     pub async fn list_provider_accounts(&self) -> Result<Vec<ProviderAccountRecord>, StoreError> {
         let rows = sqlx::query(
             "select id, provider, credential_kind, payload_version, state, external_account_id,
@@ -715,6 +750,53 @@ impl PostgresPlatformStore {
         rows.into_iter()
             .map(|row| account_inspection_from_row(&row))
             .collect()
+    }
+
+    pub async fn upsert_provider_account_quota_snapshot(
+        &self,
+        provider_account_id: Uuid,
+        snapshot: QuotaSnapshot,
+    ) -> Result<ProviderAccountQuotaSnapshotRecord, StoreError> {
+        let details = snapshot.details.unwrap_or_else(|| json!({}));
+        sqlx::query(
+            "insert into account_quota_snapshots
+             (provider_account_id, plan_label, remaining_requests_hint, details, checked_at)
+             values ($1, $2, $3, $4, $5)
+             on conflict (provider_account_id) do update
+             set plan_label = excluded.plan_label,
+                 remaining_requests_hint = excluded.remaining_requests_hint,
+                 details = excluded.details,
+                 checked_at = excluded.checked_at",
+        )
+        .bind(provider_account_id)
+        .bind(snapshot.plan_label)
+        .bind(snapshot.remaining_requests_hint.map(|value| value as i64))
+        .bind(details)
+        .bind(snapshot.checked_at)
+        .execute(&self.pool)
+        .await
+        .map_err(store_backend_error)?;
+
+        self.provider_account_quota_snapshot(provider_account_id)
+            .await?
+            .ok_or(StoreError::NotFound)
+    }
+
+    pub async fn provider_account_quota_snapshot(
+        &self,
+        provider_account_id: Uuid,
+    ) -> Result<Option<ProviderAccountQuotaSnapshotRecord>, StoreError> {
+        let row = sqlx::query(
+            "select provider_account_id, plan_label, remaining_requests_hint, details, checked_at
+             from account_quota_snapshots
+             where provider_account_id = $1",
+        )
+        .bind(provider_account_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(store_backend_error)?;
+        row.map(|row| provider_account_quota_snapshot_from_row(&row))
+            .transpose()
     }
 
     pub async fn provider_account_envelope(
@@ -845,6 +927,11 @@ impl PostgresPlatformStore {
         .await
         .map_err(store_backend_error)?;
 
+        for model_id in &record.capabilities {
+            self.ensure_route_group_and_binding(&record.provider, model_id, record.id)
+                .await?;
+        }
+
         Ok(record)
     }
 
@@ -884,9 +971,9 @@ impl PostgresPlatformStore {
         .await
         .map_err(store_backend_error)?;
 
-        if row.is_none() {
+        let Some(row) = row else {
             return Ok(None);
-        }
+        };
 
         sqlx::query(
             "update account_runtime
@@ -899,7 +986,13 @@ impl PostgresPlatformStore {
         .await
         .map_err(store_backend_error)?;
 
-        row.map(|row| provider_account_from_row(&row)).transpose()
+        let record = provider_account_from_row(&row)?;
+        for model_id in &record.capabilities {
+            self.ensure_route_group_and_binding(&record.provider, model_id, account_id)
+                .await?;
+        }
+
+        Ok(Some(record))
     }
 
     pub async fn rotate_provider_account_secret(
@@ -997,28 +1090,67 @@ impl PostgresPlatformStore {
         provider_kind: String,
         upstream_model: String,
     ) -> Result<RouteGroupRecord, StoreError> {
-        let record = RouteGroupRecord {
-            id: Uuid::new_v4(),
-            slug: public_model.replace('.', "-"),
-            public_model,
-            provider_kind,
-            upstream_model,
-            created_at: Utc::now(),
-        };
-        sqlx::query(
+        let row = sqlx::query(
             "insert into route_groups (id, slug, public_model, provider_kind, upstream_model, created_at)
-             values ($1, $2, $3, $4, $5, $6)",
+             values ($1, $2, $3, $4, $5, $6)
+             on conflict (public_model, provider_kind) do update
+             set slug = excluded.slug,
+                 upstream_model = excluded.upstream_model
+             returning id, slug, public_model, provider_kind, upstream_model, created_at",
         )
-        .bind(record.id)
-        .bind(&record.slug)
-        .bind(&record.public_model)
-        .bind(&record.provider_kind)
-        .bind(&record.upstream_model)
-        .bind(record.created_at)
-        .execute(&self.pool)
+        .bind(Uuid::new_v4())
+        .bind(derive_route_group_slug(&provider_kind, &public_model))
+        .bind(public_model)
+        .bind(provider_kind)
+        .bind(upstream_model)
+        .bind(Utc::now())
+        .fetch_one(&self.pool)
         .await
         .map_err(store_backend_error)?;
-        Ok(record)
+        route_group_from_row(&row)
+    }
+
+    pub async fn ensure_route_group_and_binding(
+        &self,
+        provider_kind: &str,
+        upstream_model: &str,
+        account_id: Uuid,
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await.map_err(store_backend_error)?;
+        let route_group = sqlx::query(
+            "insert into route_groups (id, slug, public_model, provider_kind, upstream_model, created_at)
+             values ($1, $2, $3, $4, $5, $6)
+             on conflict (public_model, provider_kind) do update
+             set slug = excluded.slug,
+                 upstream_model = excluded.upstream_model
+             returning id, slug, public_model, provider_kind, upstream_model, created_at",
+        )
+        .bind(Uuid::new_v4())
+        .bind(derive_route_group_slug(provider_kind, upstream_model))
+        .bind(upstream_model)
+        .bind(provider_kind)
+        .bind(upstream_model)
+        .bind(Utc::now())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(store_backend_error)
+        .and_then(|row| route_group_from_row(&row))?;
+
+        sqlx::query(
+            "insert into route_group_bindings
+             (id, route_group_id, provider_account_id, weight, max_in_flight, created_at)
+             values ($1, $2, $3, 100, 16, $4)
+             on conflict (route_group_id, provider_account_id) do nothing",
+        )
+        .bind(Uuid::new_v4())
+        .bind(route_group.id)
+        .bind(account_id)
+        .bind(Utc::now())
+        .execute(&mut *tx)
+        .await
+        .map_err(store_backend_error)?;
+
+        tx.commit().await.map_err(store_backend_error)
     }
 
     pub async fn list_route_groups(&self) -> Result<Vec<RouteGroupRecord>, StoreError> {
@@ -1031,6 +1163,22 @@ impl PostgresPlatformStore {
         .map_err(store_backend_error)?;
         rows.into_iter()
             .map(|row| route_group_from_row(&row))
+            .collect()
+    }
+
+    pub async fn list_route_group_bindings(
+        &self,
+    ) -> Result<Vec<RouteGroupBindingRecord>, StoreError> {
+        let rows = sqlx::query(
+            "select id, route_group_id, provider_account_id, weight, max_in_flight, created_at
+             from route_group_bindings
+             order by created_at desc, id desc",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(store_backend_error)?;
+        rows.into_iter()
+            .map(|row| route_group_binding_from_row(&row))
             .collect()
     }
 
@@ -1057,29 +1205,25 @@ impl PostgresPlatformStore {
             return Err(AuthError::Unauthorized);
         }
 
-        let record = RouteGroupBindingRecord {
-            id: Uuid::new_v4(),
-            route_group_id,
-            provider_account_id,
-            weight,
-            max_in_flight,
-            created_at: Utc::now(),
-        };
-
-        sqlx::query(
+        let row = sqlx::query(
             "insert into route_group_bindings
              (id, route_group_id, provider_account_id, weight, max_in_flight, created_at)
-             values ($1, $2, $3, $4, $5, $6)",
+             values ($1, $2, $3, $4, $5, $6)
+             on conflict (route_group_id, provider_account_id) do update
+             set weight = excluded.weight,
+                 max_in_flight = excluded.max_in_flight
+             returning id, route_group_id, provider_account_id, weight, max_in_flight, created_at",
         )
-        .bind(record.id)
-        .bind(record.route_group_id)
-        .bind(record.provider_account_id)
-        .bind(record.weight as i32)
-        .bind(record.max_in_flight as i32)
-        .bind(record.created_at)
-        .execute(&self.pool)
+        .bind(Uuid::new_v4())
+        .bind(route_group_id)
+        .bind(provider_account_id)
+        .bind(weight as i32)
+        .bind(max_in_flight as i32)
+        .bind(Utc::now())
+        .fetch_one(&self.pool)
         .await
         .map_err(auth_backend_error)?;
+        let record = route_group_binding_from_row(&row).map_err(auth_backend_error)?;
 
         sqlx::query("update account_runtime set max_in_flight = $1 where provider_account_id = $2")
             .bind(max_in_flight as i32)
@@ -1507,6 +1651,15 @@ fn audit_event_from_row(row: &PgRow) -> Result<AuditEvent, StoreError> {
     })
 }
 
+fn alert_delivery_receipt_from_row(row: &PgRow) -> Result<AlertDeliveryReceipt, StoreError> {
+    Ok(AlertDeliveryReceipt {
+        id: row.try_get("id").map_err(store_backend_error)?,
+        alert_id: row.try_get("alert_id").map_err(store_backend_error)?,
+        destination: row.try_get("destination").map_err(store_backend_error)?,
+        delivered_at: row.try_get("delivered_at").map_err(store_backend_error)?,
+    })
+}
+
 fn provider_account_from_row(row: &PgRow) -> Result<ProviderAccountRecord, StoreError> {
     let Json(labels): Json<Vec<String>> = row.try_get("labels").map_err(store_backend_error)?;
     let Json(tags): Json<BTreeMap<String, String>> =
@@ -1557,6 +1710,23 @@ fn route_group_from_row(row: &PgRow) -> Result<RouteGroupRecord, StoreError> {
     })
 }
 
+fn route_group_binding_from_row(row: &PgRow) -> Result<RouteGroupBindingRecord, StoreError> {
+    Ok(RouteGroupBindingRecord {
+        id: row.try_get("id").map_err(store_backend_error)?,
+        route_group_id: row.try_get("route_group_id").map_err(store_backend_error)?,
+        provider_account_id: row
+            .try_get("provider_account_id")
+            .map_err(store_backend_error)?,
+        weight: row
+            .try_get::<i32, _>("weight")
+            .map_err(store_backend_error)? as u32,
+        max_in_flight: row
+            .try_get::<i32, _>("max_in_flight")
+            .map_err(store_backend_error)? as u32,
+        created_at: row.try_get("created_at").map_err(store_backend_error)?,
+    })
+}
+
 fn account_inspection_from_row(row: &PgRow) -> Result<AccountInspectionRecord, StoreError> {
     Ok(AccountInspectionRecord {
         id: row.try_get("id").map_err(store_backend_error)?,
@@ -1573,6 +1743,26 @@ fn account_inspection_from_row(row: &PgRow) -> Result<AccountInspectionRecord, S
         error_code: row.try_get("error_code").map_err(store_backend_error)?,
         error_message: row.try_get("error_message").map_err(store_backend_error)?,
         inspected_at: row.try_get("inspected_at").map_err(store_backend_error)?,
+    })
+}
+
+fn provider_account_quota_snapshot_from_row(
+    row: &PgRow,
+) -> Result<ProviderAccountQuotaSnapshotRecord, StoreError> {
+    let remaining_requests_hint = row
+        .try_get::<Option<i64>, _>("remaining_requests_hint")
+        .map_err(store_backend_error)?
+        .map(|value| u64::try_from(value).map_err(|error| StoreError::Backend(error.to_string())))
+        .transpose()?;
+
+    Ok(ProviderAccountQuotaSnapshotRecord {
+        provider_account_id: row
+            .try_get("provider_account_id")
+            .map_err(store_backend_error)?,
+        plan_label: row.try_get("plan_label").map_err(store_backend_error)?,
+        remaining_requests_hint,
+        details: row.try_get("details").map_err(store_backend_error)?,
+        checked_at: row.try_get("checked_at").map_err(store_backend_error)?,
     })
 }
 

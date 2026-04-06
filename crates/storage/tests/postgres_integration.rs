@@ -3,6 +3,7 @@ use pg_embed::{
     pg_fetch::{PG_V17, PgFetchSettings},
     postgres::{PgEmbed, PgSettings},
 };
+use protocol_core::{ModelCapability, ModelDescriptor};
 use provider_core::{AccountCapabilities, ProviderAccountEnvelope, ValidatedProviderAccount};
 use std::{collections::BTreeMap, net::TcpListener, time::Duration};
 use storage::PostgresPlatformStore;
@@ -129,7 +130,17 @@ async fn postgres_store_round_trips_keys_and_provider_credentials() {
                 expires_at: None,
             },
             AccountCapabilities {
-                models: vec![],
+                models: vec![ModelDescriptor {
+                    id: "gpt-4.1-mini".to_string(),
+                    route_group: "gpt-4.1-mini".to_string(),
+                    provider_kind: "openai_codex".to_string(),
+                    upstream_model: "gpt-4.1-mini".to_string(),
+                    capabilities: vec![
+                        ModelCapability::Chat,
+                        ModelCapability::Responses,
+                        ModelCapability::Streaming,
+                    ],
+                }],
                 supports_refresh: true,
                 supports_quota_probe: false,
             },
@@ -151,6 +162,63 @@ async fn postgres_store_round_trips_keys_and_provider_credentials() {
             .map(String::as_str),
         Some("integration")
     );
+
+    let route_groups = store.list_route_groups().await.expect("route groups");
+    assert!(route_groups.iter().any(|route_group| {
+        route_group.public_model == "gpt-4.1-mini"
+            && route_group.provider_kind == "openai_codex"
+            && route_group.upstream_model == "gpt-4.1-mini"
+    }));
+
+    let candidates = store
+        .scheduler_candidates("gpt-4.1-mini")
+        .await
+        .expect("scheduler candidates");
+    assert!(
+        candidates
+            .iter()
+            .any(|candidate| candidate.account_id == record.id)
+    );
+
+    store
+        .revalidate_provider_account(
+            record.id,
+            ValidatedProviderAccount {
+                provider_account_id: "acct_integration".to_string(),
+                redacted_display: Some("d***@***".to_string()),
+                expires_at: None,
+            },
+            AccountCapabilities {
+                models: vec![
+                    ModelDescriptor {
+                        id: "gpt-4.1-mini".to_string(),
+                        route_group: "gpt-4.1-mini".to_string(),
+                        provider_kind: "openai_codex".to_string(),
+                        upstream_model: "gpt-4.1-mini".to_string(),
+                        capabilities: vec![ModelCapability::Chat],
+                    },
+                    ModelDescriptor {
+                        id: "codex-mini-latest".to_string(),
+                        route_group: "codex-mini-latest".to_string(),
+                        provider_kind: "openai_codex".to_string(),
+                        upstream_model: "codex-mini-latest".to_string(),
+                        capabilities: vec![ModelCapability::Responses],
+                    },
+                ],
+                supports_refresh: true,
+                supports_quota_probe: false,
+            },
+        )
+        .await
+        .expect("revalidate")
+        .expect("record");
+
+    let models = store
+        .list_tenant_models(tenant.id)
+        .await
+        .expect("tenant models");
+    assert!(models.iter().any(|model| model.id == "gpt-4.1-mini"));
+    assert!(models.iter().any(|model| model.id == "codex-mini-latest"));
 
     pg.stop_db().await.expect("stop");
 }

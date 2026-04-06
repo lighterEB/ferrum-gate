@@ -134,6 +134,14 @@ create table if not exists account_inspections (
   inspected_at timestamptz not null default now()
 );
 
+create table if not exists account_quota_snapshots (
+  provider_account_id uuid primary key references provider_accounts(id),
+  plan_label text,
+  remaining_requests_hint bigint,
+  details jsonb not null default '{}'::jsonb,
+  checked_at timestamptz not null
+);
+
 create table if not exists account_probe_leases (
   provider_account_id uuid primary key references provider_accounts(id),
   lease_id uuid not null,
@@ -147,3 +155,17 @@ create table if not exists account_refresh_leases (
   leased_at timestamptz not null default now(),
   leased_until timestamptz not null
 );
+
+create table if not exists alert_delivery_receipts (
+  id uuid primary key,
+  alert_id uuid not null,
+  destination text not null,
+  delivered_at timestamptz not null default now(),
+  unique (alert_id, destination)
+);
+
+create unique index if not exists route_groups_public_model_provider_kind_idx
+  on route_groups (public_model, provider_kind);
+
+create unique index if not exists route_group_bindings_route_group_account_idx
+  on route_group_bindings (route_group_id, provider_account_id);

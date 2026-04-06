@@ -3,17 +3,19 @@ use axum::{
     Router,
     body::to_bytes,
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Json, Response},
     routing::{get, post},
 };
 use provider_core::{ProviderAccountEnvelope, ProviderError, ProviderErrorKind, ProviderRegistry};
 use provider_openai_codex::OpenAiCodexProvider;
+use reqwest::Client;
 use scheduler::{AccountState, ProviderOutcome};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{net::SocketAddr, sync::Arc};
+use std::{collections::HashSet, net::SocketAddr, sync::Arc};
 use storage::{AuthError, Permission, PlatformStore, ScopeTarget, ServiceAccountPrincipal};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::info;
 use uuid::Uuid;
 
@@ -35,7 +37,7 @@ impl ControlPlaneState {
 }
 
 pub fn app(state: ControlPlaneState) -> Router {
-    Router::new()
+    let router = Router::new()
         .route(
             "/internal/v1/provider-accounts",
             get(list_provider_accounts).post(import_provider_account),
@@ -73,6 +75,10 @@ pub fn app(state: ControlPlaneState) -> Router {
             post(probe_provider_account),
         )
         .route(
+            "/internal/v1/provider-accounts/{id}/quota",
+            get(get_provider_account_quota),
+        )
+        .route(
             "/internal/v1/provider-accounts/{id}/quota/probe",
             post(probe_provider_account_quota),
         )
@@ -92,6 +98,7 @@ pub fn app(state: ControlPlaneState) -> Router {
             "/internal/v1/route-groups",
             get(list_route_groups).post(create_route_group),
         )
+        .route("/internal/v1/routing/overview", get(routing_overview))
         .route(
             "/internal/v1/route-groups/{id}/bindings",
             post(bind_route_group),
@@ -105,8 +112,17 @@ pub fn app(state: ControlPlaneState) -> Router {
             get(list_provider_accounts),
         )
         .route("/internal/v1/audit/events", get(list_audit_events))
-        .route("/internal/v1/alerts/outbox", get(list_alerts_outbox))
-        .with_state(state)
+        .route(
+            "/internal/v1/alerts/outbox",
+            get(list_alerts_outbox).post(deliver_alerts_outbox),
+        )
+        .with_state(state);
+
+    if let Some(cors) = console_cors_layer() {
+        router.layer(cors)
+    } else {
+        router
+    }
 }
 
 pub async fn run(addr: SocketAddr, state: ControlPlaneState) -> Result<()> {
@@ -114,6 +130,33 @@ pub async fn run(addr: SocketAddr, state: ControlPlaneState) -> Result<()> {
     info!("control-plane listening on {addr}");
     axum::serve(listener, app(state)).await?;
     Ok(())
+}
+
+fn console_cors_layer() -> Option<CorsLayer> {
+    let allowed_origins = std::env::var("FERRUMGATE_CONSOLE_ALLOWED_ORIGINS")
+        .or_else(|_| std::env::var("FERRUMGATE_TENANT_API_ALLOWED_ORIGINS"))
+        .ok()?;
+    let origins = allowed_origins
+        .split(',')
+        .map(str::trim)
+        .filter(|origin| !origin.is_empty())
+        .map(HeaderValue::from_str)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+
+    if origins.is_empty() {
+        return None;
+    }
+
+    Some(
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::list(origins))
+            .allow_methods([Method::GET, Method::POST])
+            .allow_headers([
+                axum::http::header::AUTHORIZATION,
+                axum::http::header::CONTENT_TYPE,
+            ]),
+    )
 }
 
 async fn import_provider_account(
@@ -227,7 +270,19 @@ async fn list_provider_accounts(
     }
 
     match state.store.list_provider_accounts().await {
-        Ok(accounts) => Json(json!({ "data": accounts })).into_response(),
+        Ok(accounts) => {
+            let mut views = Vec::with_capacity(accounts.len());
+            for account in accounts {
+                let quota = state
+                    .store
+                    .provider_account_quota_snapshot(account.id)
+                    .await
+                    .ok()
+                    .flatten();
+                views.push(ProviderAccountRuntimeView { account, quota });
+            }
+            Json(json!({ "data": views })).into_response()
+        }
         Err(error) => control_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     }
 }
@@ -509,6 +564,37 @@ async fn probe_provider_account_quota(
     }
 }
 
+async fn get_provider_account_quota(
+    State(state): State<ControlPlaneState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Response {
+    if authorize(
+        &state,
+        &headers,
+        Permission::ViewRuntime,
+        ScopeTarget::Global,
+    )
+    .await
+    .is_err()
+    {
+        return control_error(StatusCode::UNAUTHORIZED, "Unauthorized");
+    }
+
+    match state.store.provider_account(id).await {
+        Ok(Some(_)) => match state.store.provider_account_quota_snapshot(id).await {
+            Ok(quota) => Json(json!(ProviderAccountQuotaResponse {
+                account_id: id,
+                quota,
+            }))
+            .into_response(),
+            Err(error) => control_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+        },
+        Ok(None) => control_error(StatusCode::NOT_FOUND, "Provider account not found"),
+        Err(error) => control_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    }
+}
+
 async fn refresh_provider_account(
     State(state): State<ControlPlaneState>,
     headers: HeaderMap,
@@ -639,6 +725,54 @@ async fn list_route_groups(State(state): State<ControlPlaneState>, headers: Head
         Ok(route_groups) => Json(json!({ "data": route_groups })).into_response(),
         Err(error) => control_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     }
+}
+
+async fn routing_overview(State(state): State<ControlPlaneState>, headers: HeaderMap) -> Response {
+    if authorize(
+        &state,
+        &headers,
+        Permission::ViewRuntime,
+        ScopeTarget::Global,
+    )
+    .await
+    .is_err()
+    {
+        return control_error(StatusCode::UNAUTHORIZED, "Unauthorized");
+    }
+
+    let route_groups = match state.store.list_route_groups().await {
+        Ok(route_groups) => route_groups,
+        Err(error) => return control_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
+    let bindings = match state.store.list_route_group_bindings().await {
+        Ok(bindings) => bindings,
+        Err(error) => return control_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
+
+    let binding_counts = bindings.into_iter().fold(
+        std::collections::HashMap::<Uuid, usize>::new(),
+        |mut counts, binding| {
+            *counts.entry(binding.route_group_id).or_insert(0) += 1;
+            counts
+        },
+    );
+    let route_groups = route_groups
+        .into_iter()
+        .map(|route_group| RoutingOverviewItem {
+            binding_count: binding_counts
+                .get(&route_group.id)
+                .copied()
+                .unwrap_or_default(),
+            route_group,
+        })
+        .collect::<Vec<_>>();
+
+    Json(json!(RoutingOverviewResponse {
+        route_groups,
+        bindings_count: binding_counts.values().sum(),
+        auto_derived: true,
+    }))
+    .into_response()
 }
 
 async fn bind_route_group(
@@ -799,24 +933,124 @@ async fn list_alerts_outbox(
         return control_error(StatusCode::UNAUTHORIZED, "Unauthorized");
     }
 
-    let Some(resource) = query.resource else {
-        return Json(json!({ "data": Vec::<AlertsOutboxItem>::new() })).into_response();
-    };
-
-    let Some(account_id) = parse_provider_account_resource(&resource) else {
-        return control_error(StatusCode::BAD_REQUEST, "Unsupported resource");
-    };
-
-    match state.store.list_account_inspections(account_id).await {
-        Ok(inspections) => Json(json!({
-            "data": inspections
-                .into_iter()
-                .filter_map(|inspection| alert_from_inspection(&resource, inspection))
-                .collect::<Vec<_>>()
-        }))
-        .into_response(),
-        Err(error) => control_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    match collect_alerts_outbox(&state, query.resource.as_deref()).await {
+        Ok(alerts) => Json(json!({ "data": alerts })).into_response(),
+        Err(response) => response,
     }
+}
+
+async fn deliver_alerts_outbox(
+    State(state): State<ControlPlaneState>,
+    headers: HeaderMap,
+    Json(payload): Json<DeliverAlertsRequest>,
+) -> Response {
+    if authorize(&state, &headers, Permission::ViewAudit, ScopeTarget::Global)
+        .await
+        .is_err()
+    {
+        return control_error(StatusCode::UNAUTHORIZED, "Unauthorized");
+    }
+
+    let alerts = match collect_alerts_outbox(&state, payload.resource.as_deref()).await {
+        Ok(alerts) => alerts,
+        Err(response) => return response,
+    };
+    let receipts = match state
+        .store
+        .list_alert_delivery_receipts(&payload.webhook_url)
+        .await
+    {
+        Ok(receipts) => receipts,
+        Err(error) => return control_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
+    let delivered_ids = receipts
+        .into_iter()
+        .map(|receipt| receipt.alert_id)
+        .collect::<HashSet<_>>();
+    let client = Client::new();
+
+    let mut delivered = 0_u64;
+    let mut skipped = 0_u64;
+    let mut failed = 0_u64;
+    let mut results = Vec::new();
+
+    for alert in alerts.into_iter().take(payload.limit.max(1)) {
+        if delivered_ids.contains(&alert.id) {
+            skipped += 1;
+            results.push(AlertDeliveryResult {
+                alert_id: alert.id,
+                status: "skipped".to_string(),
+                response_status: None,
+                error: None,
+            });
+            continue;
+        }
+
+        match client.post(&payload.webhook_url).json(&alert).send().await {
+            Ok(response) if response.status().is_success() => {
+                match state
+                    .store
+                    .record_alert_delivery(alert.id, payload.webhook_url.clone())
+                    .await
+                {
+                    Ok(true) => {
+                        delivered += 1;
+                        results.push(AlertDeliveryResult {
+                            alert_id: alert.id,
+                            status: "delivered".to_string(),
+                            response_status: Some(response.status().as_u16()),
+                            error: None,
+                        });
+                    }
+                    Ok(false) => {
+                        skipped += 1;
+                        results.push(AlertDeliveryResult {
+                            alert_id: alert.id,
+                            status: "skipped".to_string(),
+                            response_status: Some(response.status().as_u16()),
+                            error: None,
+                        });
+                    }
+                    Err(error) => {
+                        failed += 1;
+                        results.push(AlertDeliveryResult {
+                            alert_id: alert.id,
+                            status: "failed".to_string(),
+                            response_status: Some(response.status().as_u16()),
+                            error: Some(error.to_string()),
+                        });
+                    }
+                }
+            }
+            Ok(response) => {
+                failed += 1;
+                results.push(AlertDeliveryResult {
+                    alert_id: alert.id,
+                    status: "failed".to_string(),
+                    response_status: Some(response.status().as_u16()),
+                    error: Some(format!("webhook returned {}", response.status())),
+                });
+            }
+            Err(error) => {
+                failed += 1;
+                results.push(AlertDeliveryResult {
+                    alert_id: alert.id,
+                    status: "failed".to_string(),
+                    response_status: None,
+                    error: Some(error.to_string()),
+                });
+            }
+        }
+    }
+
+    Json(json!({
+        "total": results.len(),
+        "delivered": delivered,
+        "skipped": skipped,
+        "failed": failed,
+        "results": results,
+    }))
+    .into_response()
 }
 
 async fn authorize(
@@ -1032,6 +1266,15 @@ struct AlertsOutboxQuery {
     resource: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct DeliverAlertsRequest {
+    webhook_url: String,
+    #[serde(default = "default_alert_delivery_limit")]
+    limit: usize,
+    #[serde(default)]
+    resource: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct ProbeProviderAccountResult {
     account_id: Uuid,
@@ -1040,6 +1283,35 @@ struct ProbeProviderAccountResult {
     provider_account: Option<storage::ProviderAccountRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<ProbeProviderAccountError>,
+}
+
+#[derive(Debug, Serialize)]
+struct ProviderAccountQuotaResponse {
+    account_id: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quota: Option<storage::ProviderAccountQuotaSnapshotRecord>,
+}
+
+#[derive(Debug, Serialize)]
+struct ProviderAccountRuntimeView {
+    #[serde(flatten)]
+    account: storage::ProviderAccountRecord,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quota: Option<storage::ProviderAccountQuotaSnapshotRecord>,
+}
+
+#[derive(Debug, Serialize)]
+struct RoutingOverviewResponse {
+    route_groups: Vec<RoutingOverviewItem>,
+    bindings_count: usize,
+    auto_derived: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct RoutingOverviewItem {
+    #[serde(flatten)]
+    route_group: storage::RouteGroupRecord,
+    binding_count: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -1059,6 +1331,20 @@ struct AlertsOutboxItem {
     resource: String,
     message: String,
     occurred_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Serialize)]
+struct AlertDeliveryResult {
+    alert_id: Uuid,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+fn default_alert_delivery_limit() -> usize {
+    50
 }
 
 async fn execute_provider_account_probe(
@@ -1170,8 +1456,14 @@ async fn execute_provider_account_quota_probe(
         }
     };
 
-    match provider.probe_quota(&validated).await {
+    match provider.probe_quota(&envelope, &validated).await {
         Ok(snapshot) => {
+            state
+                .store
+                .upsert_provider_account_quota_snapshot(id, snapshot.clone())
+                .await
+                .ok();
+
             if snapshot.remaining_requests_hint == Some(0) {
                 state
                     .store
@@ -1262,9 +1554,19 @@ async fn execute_provider_account_quota_probe(
                 error: None,
             }))
         }
-        Err(error) => Ok(Some(
-            probe_provider_account_failure(state, principal_subject, id, &error).await,
-        )),
+        Err(error)
+            if matches!(
+                error.kind,
+                ProviderErrorKind::InvalidCredentials
+                    | ProviderErrorKind::RateLimited
+                    | ProviderErrorKind::UpstreamUnavailable
+            ) =>
+        {
+            Ok(Some(
+                probe_provider_account_failure(state, principal_subject, id, &error).await,
+            ))
+        }
+        Err(error) => Err(control_error(provider_error_status(&error), &error.message)),
     }
 }
 
@@ -1351,6 +1653,52 @@ fn parse_provider_account_resource(resource: &str) -> Option<Uuid> {
         .and_then(|value| Uuid::parse_str(value).ok())
 }
 
+async fn collect_alerts_outbox(
+    state: &ControlPlaneState,
+    resource: Option<&str>,
+) -> Result<Vec<AlertsOutboxItem>, Response> {
+    let resources = match resource {
+        Some(resource) => vec![resource.to_string()],
+        None => state
+            .store
+            .list_provider_accounts()
+            .await
+            .map_err(|error| control_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()))?
+            .into_iter()
+            .map(|account| format!("provider_account:{}", account.id))
+            .collect(),
+    };
+
+    let mut alerts = Vec::new();
+    for resource in resources {
+        let Some(account_id) = parse_provider_account_resource(&resource) else {
+            return Err(control_error(
+                StatusCode::BAD_REQUEST,
+                "Unsupported resource",
+            ));
+        };
+        let inspections = state
+            .store
+            .list_account_inspections(account_id)
+            .await
+            .map_err(|error| {
+                control_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string())
+            })?;
+        alerts.extend(
+            inspections
+                .into_iter()
+                .filter_map(|inspection| alert_from_inspection(&resource, inspection)),
+        );
+    }
+
+    alerts.sort_by(|left, right| {
+        left.occurred_at
+            .cmp(&right.occurred_at)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(alerts)
+}
+
 fn alert_from_inspection(
     resource: &str,
     inspection: storage::AccountInspectionRecord,
@@ -1401,7 +1749,7 @@ mod tests {
     use std::{
         net::SocketAddr,
         sync::{
-            Arc,
+            Arc, Mutex,
             atomic::{AtomicBool, Ordering},
         },
         time::Duration,
@@ -1572,6 +1920,34 @@ mod tests {
         addr
     }
 
+    async fn spawn_alert_webhook_server() -> (SocketAddr, Arc<Mutex<Vec<serde_json::Value>>>) {
+        let deliveries = Arc::new(Mutex::new(Vec::new()));
+        let shared = deliveries.clone();
+        let app = Router::new().route(
+            "/webhook",
+            post(move |request: AxumRequest| {
+                let shared = shared.clone();
+                async move {
+                    let body = axum::body::to_bytes(request.into_body(), usize::MAX)
+                        .await
+                        .expect("webhook body");
+                    let payload: serde_json::Value =
+                        serde_json::from_slice(&body).expect("webhook payload");
+                    shared.lock().expect("deliveries lock").push(payload);
+                    StatusCode::NO_CONTENT
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+        (addr, deliveries)
+    }
+
     async fn seed_openai_provider_account(
         state: &ControlPlaneState,
         api_base: String,
@@ -1628,6 +2004,7 @@ mod tests {
 
     #[derive(Clone, Copy)]
     enum QuotaTestBehavior {
+        Healthy,
         Exhausted,
         Suspended,
     }
@@ -1685,12 +2062,49 @@ mod tests {
 
         async fn probe_quota(
             &self,
+            _envelope: &ProviderAccountEnvelope,
             _account: &ValidatedProviderAccount,
         ) -> Result<QuotaSnapshot, ProviderError> {
             match self.behavior {
+                QuotaTestBehavior::Healthy => Ok(QuotaSnapshot {
+                    plan_label: Some("team".to_string()),
+                    remaining_requests_hint: Some(42),
+                    details: Some(json!({
+                        "plan_type": "team",
+                        "rate_limit": {
+                            "allowed": true,
+                            "limit_reached": false,
+                            "primary_window": {
+                                "used_percent": 12,
+                                "limit_window_seconds": 604800,
+                                "reset_after_seconds": 3600,
+                                "reset_at": 1776064545
+                            }
+                        },
+                        "code_review_rate_limit": {
+                            "allowed": true,
+                            "limit_reached": false
+                        },
+                        "credits": {
+                            "has_credits": false,
+                            "unlimited": false
+                        },
+                        "spend_control": {
+                            "reached": false
+                        }
+                    })),
+                    checked_at: Utc::now(),
+                }),
                 QuotaTestBehavior::Exhausted => Ok(QuotaSnapshot {
                     plan_label: Some("team".to_string()),
                     remaining_requests_hint: Some(0),
+                    details: Some(json!({
+                        "plan_type": "team",
+                        "rate_limit": {
+                            "allowed": false,
+                            "limit_reached": true
+                        }
+                    })),
                     checked_at: Utc::now(),
                 }),
                 QuotaTestBehavior::Suspended => Err(ProviderError::new(
@@ -1960,6 +2374,49 @@ mod tests {
             .expect("body");
         let body = String::from_utf8_lossy(&body);
         assert!(body.contains("Provider adapter not registered"));
+    }
+
+    #[tokio::test]
+    async fn routing_overview_reports_auto_derived_route_groups() {
+        let app = app(ControlPlaneState::demo());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/v1/routing/overview")
+                    .header(http::header::AUTHORIZATION, "Bearer fg_cp_admin_demo")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+
+        assert_eq!(
+            body.get("auto_derived")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert!(
+            body.pointer("/bindings_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default()
+                >= 1
+        );
+        assert!(
+            body.pointer("/route_groups")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|route_groups| route_groups.iter().any(|route_group| {
+                    route_group
+                        .get("public_model")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("gpt-4.1-mini")
+                }))
+        );
     }
 
     #[tokio::test]
@@ -2629,6 +3086,141 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn quota_details_endpoint_returns_null_before_first_probe() {
+        let state = quota_test_state(QuotaTestBehavior::Healthy);
+        let record = seed_quota_test_provider_account(&state, "acct_quota_empty").await;
+
+        let response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!(
+                        "/internal/v1/provider-accounts/{}/quota",
+                        record.id
+                    ))
+                    .header(http::header::AUTHORIZATION, "Bearer fg_cp_admin_demo")
+                    .body(Body::empty())
+                    .expect("quota get request"),
+            )
+            .await
+            .expect("quota get response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("quota get body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("quota get json");
+        assert_eq!(json["account_id"], record.id.to_string());
+        assert!(json["quota"].is_null());
+    }
+
+    #[tokio::test]
+    async fn quota_details_endpoint_returns_latest_snapshot_after_probe() {
+        let state = quota_test_state(QuotaTestBehavior::Healthy);
+        let record = seed_quota_test_provider_account(&state, "acct_quota_details").await;
+
+        let probe = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/internal/v1/provider-accounts/{}/quota/probe",
+                        record.id
+                    ))
+                    .header(http::header::AUTHORIZATION, "Bearer fg_cp_admin_demo")
+                    .body(Body::empty())
+                    .expect("quota probe request"),
+            )
+            .await
+            .expect("quota probe response");
+        assert_eq!(probe.status(), StatusCode::OK);
+
+        let response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!(
+                        "/internal/v1/provider-accounts/{}/quota",
+                        record.id
+                    ))
+                    .header(http::header::AUTHORIZATION, "Bearer fg_cp_admin_demo")
+                    .body(Body::empty())
+                    .expect("quota get request"),
+            )
+            .await
+            .expect("quota get response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("quota get body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("quota get json");
+        assert_eq!(json["account_id"], record.id.to_string());
+        assert_eq!(json["quota"]["plan_label"], "team");
+        assert_eq!(json["quota"]["remaining_requests_hint"], 42);
+        assert_eq!(
+            json["quota"]["details"]["rate_limit"]["primary_window"]["used_percent"],
+            12
+        );
+        assert_eq!(json["quota"]["details"]["spend_control"]["reached"], false);
+    }
+
+    #[tokio::test]
+    async fn runtime_provider_accounts_list_includes_latest_quota_snapshot() {
+        let state = quota_test_state(QuotaTestBehavior::Healthy);
+        let record = seed_quota_test_provider_account(&state, "acct_quota_runtime_list").await;
+
+        let probe = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/internal/v1/provider-accounts/{}/quota/probe",
+                        record.id
+                    ))
+                    .header(http::header::AUTHORIZATION, "Bearer fg_cp_admin_demo")
+                    .body(Body::empty())
+                    .expect("quota probe request"),
+            )
+            .await
+            .expect("quota probe response");
+        assert_eq!(probe.status(), StatusCode::OK);
+
+        let response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/internal/v1/runtime/provider-accounts")
+                    .header(http::header::AUTHORIZATION, "Bearer fg_cp_admin_demo")
+                    .body(Body::empty())
+                    .expect("runtime provider accounts request"),
+            )
+            .await
+            .expect("runtime provider accounts response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("runtime provider accounts body");
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).expect("runtime provider accounts json");
+        let item = json["data"]
+            .as_array()
+            .expect("runtime provider accounts array")
+            .iter()
+            .find(|item| item["id"] == json!(record.id))
+            .cloned()
+            .expect("quota-enabled provider account");
+
+        assert_eq!(item["quota"]["plan_label"], "team");
+        assert_eq!(item["quota"]["remaining_requests_hint"], 42);
+        assert_eq!(
+            item["quota"]["details"]["rate_limit"]["primary_window"]["used_percent"],
+            12
+        );
+    }
+
+    #[tokio::test]
     async fn quota_probe_marks_account_invalid_when_provider_reports_account_suspension() {
         let state = quota_test_state(QuotaTestBehavior::Suspended);
         let record = seed_quota_test_provider_account(&state, "acct_quota_suspended").await;
@@ -3006,5 +3598,94 @@ mod tests {
         assert_eq!(first["kind"], "provider_account.invalid_credentials");
         assert_eq!(first["severity"], "critical");
         assert_eq!(first["resource"], format!("provider_account:{}", record.id));
+    }
+
+    #[tokio::test]
+    async fn alerts_outbox_delivery_posts_webhook_once_and_skips_duplicate_alerts() {
+        let state = ControlPlaneState::demo();
+        let record = seed_quota_test_provider_account(&state, "acct_alert_delivery").await;
+        state
+            .store
+            .record_account_inspection(
+                record.id,
+                "probe-worker".to_string(),
+                storage::AccountInspectionStatus::Unhealthy,
+                Some("invalid_credentials".to_string()),
+                Some("token_invalidated".to_string()),
+                Some("token invalidated".to_string()),
+            )
+            .await
+            .expect("inspection");
+
+        let (webhook_addr, deliveries) = spawn_alert_webhook_server().await;
+        let webhook_url = format!("http://{webhook_addr}/webhook");
+
+        let first = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/v1/alerts/outbox")
+                    .header(http::header::AUTHORIZATION, "Bearer fg_cp_admin_demo")
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "webhook_url": webhook_url,
+                            "limit": 10,
+                            "resource": format!("provider_account:{}", record.id)
+                        })
+                        .to_string(),
+                    ))
+                    .expect("deliver alerts request"),
+            )
+            .await
+            .expect("deliver alerts response");
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_body = to_bytes(first.into_body(), usize::MAX)
+            .await
+            .expect("first deliver body");
+        let first_json: serde_json::Value =
+            serde_json::from_slice(&first_body).expect("first deliver json");
+        assert_eq!(first_json["delivered"], json!(1));
+        assert_eq!(first_json["skipped"], json!(0));
+        assert_eq!(deliveries.lock().expect("deliveries lock").len(), 1);
+
+        let delivered_payload = deliveries.lock().expect("deliveries lock")[0].clone();
+        assert_eq!(
+            delivered_payload["kind"],
+            "provider_account.invalid_credentials"
+        );
+        assert_eq!(
+            delivered_payload["resource"],
+            json!(format!("provider_account:{}", record.id))
+        );
+
+        let second = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/v1/alerts/outbox")
+                    .header(http::header::AUTHORIZATION, "Bearer fg_cp_admin_demo")
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "webhook_url": format!("http://{webhook_addr}/webhook"),
+                            "limit": 10,
+                            "resource": format!("provider_account:{}", record.id)
+                        })
+                        .to_string(),
+                    ))
+                    .expect("deliver alerts request 2"),
+            )
+            .await
+            .expect("deliver alerts response 2");
+        assert_eq!(second.status(), StatusCode::OK);
+        let second_body = to_bytes(second.into_body(), usize::MAX)
+            .await
+            .expect("second deliver body");
+        let second_json: serde_json::Value =
+            serde_json::from_slice(&second_body).expect("second deliver json");
+        assert_eq!(second_json["delivered"], json!(0));
+        assert_eq!(second_json["skipped"], json!(1));
+        assert_eq!(deliveries.lock().expect("deliveries lock").len(), 1);
     }
 }

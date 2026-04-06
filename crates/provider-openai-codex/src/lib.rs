@@ -16,7 +16,7 @@ use provider_core::{
     RefreshedProviderCredentials, ValidatedProviderAccount,
 };
 use reqwest::{
-    Client, Response, StatusCode,
+    Client, Response, StatusCode, Url,
     header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue},
 };
 use serde::Deserialize;
@@ -428,6 +428,73 @@ impl OpenAiCodexProvider {
             .into_iter()
             .map(|model| self.descriptor_for_model(model.id))
             .collect())
+    }
+
+    fn quota_endpoint_url(connection: &ProviderConnectionInfo) -> Result<String, ProviderError> {
+        if !Self::uses_chatgpt_codex_endpoint(connection) {
+            return Err(ProviderError::new(
+                ProviderErrorKind::Unsupported,
+                501,
+                "quota probe is only supported for ChatGPT Codex accounts",
+            ));
+        }
+
+        let mut url = Url::parse(&connection.api_base).map_err(|error| {
+            ProviderError::new(
+                ProviderErrorKind::InvalidRequest,
+                400,
+                format!("invalid api_base for quota probe: {error}"),
+            )
+        })?;
+        url.set_path("/backend-api/wham/usage");
+        url.set_query(None);
+        url.set_fragment(None);
+        Ok(url.to_string())
+    }
+
+    async fn probe_quota_with_envelope(
+        &self,
+        envelope: &ProviderAccountEnvelope,
+    ) -> Result<QuotaSnapshot, ProviderError> {
+        let connection = self.connection_from_envelope(envelope)?;
+        let response = self
+            .client
+            .get(Self::quota_endpoint_url(&connection)?)
+            .bearer_auth(&connection.bearer_token)
+            .headers(self.build_headers(&connection)?)
+            .send()
+            .await
+            .map_err(transport_error)?;
+        let response = ensure_success(response).await?;
+        let details: Value = response.json().await.map_err(transport_error)?;
+        let body: WhamUsageResponse = serde_json::from_value(details.clone()).map_err(|error| {
+            ProviderError::new(
+                ProviderErrorKind::UpstreamUnavailable,
+                502,
+                format!("invalid wham usage payload: {error}"),
+            )
+        })?;
+
+        let exhausted = body
+            .rate_limit
+            .as_ref()
+            .is_some_and(QuotaLimitState::is_exhausted)
+            || body
+                .code_review_rate_limit
+                .as_ref()
+                .is_some_and(QuotaLimitState::is_exhausted)
+            || body
+                .spend_control
+                .as_ref()
+                .and_then(|value| value.reached)
+                .unwrap_or(false);
+
+        Ok(QuotaSnapshot {
+            plan_label: body.plan_type,
+            remaining_requests_hint: if exhausted { Some(0) } else { None },
+            details: Some(details),
+            checked_at: Utc::now(),
+        })
     }
 
     async fn refresh_with_token_endpoint(
@@ -874,22 +941,20 @@ impl ProviderAdapter for OpenAiCodexProvider {
         envelope: &ProviderAccountEnvelope,
         _account: &ValidatedProviderAccount,
     ) -> Result<AccountCapabilities, ProviderError> {
+        let connection = self.connection_from_envelope(envelope)?;
         Ok(AccountCapabilities {
             models: self.list_models(envelope).await?,
             supports_refresh: true,
-            supports_quota_probe: false,
+            supports_quota_probe: Self::uses_chatgpt_codex_endpoint(&connection),
         })
     }
 
     async fn probe_quota(
         &self,
+        envelope: &ProviderAccountEnvelope,
         _account: &ValidatedProviderAccount,
     ) -> Result<QuotaSnapshot, ProviderError> {
-        Ok(QuotaSnapshot {
-            plan_label: Some("unknown".to_string()),
-            remaining_requests_hint: None,
-            checked_at: Utc::now(),
-        })
+        self.probe_quota_with_envelope(envelope).await
     }
 
     async fn refresh_credentials(
@@ -1060,6 +1125,38 @@ struct OAuthRefreshResponse {
     id_token: Option<String>,
     #[serde(default)]
     expires_in: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WhamUsageResponse {
+    #[serde(default)]
+    plan_type: Option<String>,
+    #[serde(default)]
+    rate_limit: Option<QuotaLimitState>,
+    #[serde(default)]
+    code_review_rate_limit: Option<QuotaLimitState>,
+    #[serde(default)]
+    spend_control: Option<SpendControlState>,
+}
+
+#[derive(Debug, Deserialize)]
+struct QuotaLimitState {
+    #[serde(default)]
+    allowed: Option<bool>,
+    #[serde(default)]
+    limit_reached: Option<bool>,
+}
+
+impl QuotaLimitState {
+    fn is_exhausted(&self) -> bool {
+        self.limit_reached.unwrap_or(false) || self.allowed == Some(false)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SpendControlState {
+    #[serde(default)]
+    reached: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1982,6 +2079,65 @@ mod tests {
         addr
     }
 
+    async fn spawn_wham_usage_server(limit_reached: bool) -> SocketAddr {
+        async fn wham_usage_handler(request: Request, limit_reached: bool) -> impl IntoResponse {
+            let auth = request
+                .headers()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            let query = request.uri().query().unwrap_or_default().to_string();
+
+            assert_eq!(auth, "Bearer test-token");
+            assert!(
+                query.is_empty(),
+                "quota probe should not send client_version or other query params"
+            );
+
+            axum::Json(json!({
+                "plan_type": "team",
+                "rate_limit": {
+                    "allowed": !limit_reached,
+                    "limit_reached": limit_reached,
+                    "primary_window": {
+                        "used_percent": if limit_reached { 100 } else { 12 },
+                        "limit_window_seconds": 604800,
+                        "reset_after_seconds": if limit_reached { 120 } else { 3600 },
+                        "reset_at": 1776064545
+                    }
+                },
+                "code_review_rate_limit": {
+                    "allowed": true,
+                    "limit_reached": false
+                },
+                "credits": {
+                    "has_credits": false,
+                    "unlimited": false,
+                    "balance": null
+                },
+                "spend_control": {
+                    "reached": false
+                }
+            }))
+            .into_response()
+        }
+
+        let app = Router::new().route(
+            "/backend-api/wham/usage",
+            get(move |request: Request| wham_usage_handler(request, limit_reached)),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+        addr
+    }
+
     async fn spawn_codex_tool_call_server() -> SocketAddr {
         async fn codex_responses_handler(request: Request) -> impl IntoResponse {
             let auth = request
@@ -2518,6 +2674,82 @@ mod tests {
             .expect_err("refresh should fail");
         assert_eq!(error.kind, ProviderErrorKind::InvalidCredentials);
         assert_eq!(error.code.as_deref(), Some("invalid_grant"));
+    }
+
+    #[tokio::test]
+    async fn probe_quota_calls_wham_usage_without_client_version() {
+        let addr = spawn_wham_usage_server(false).await;
+        let provider = OpenAiCodexProvider::shared(Arc::new(PlatformStore::demo()));
+        let envelope = ProviderAccountEnvelope {
+            provider: "openai_codex".to_string(),
+            credential_kind: "oauth_tokens".to_string(),
+            payload_version: "v1".to_string(),
+            credentials: json!({
+                "access_token": "test-token",
+                "account_id": "acct_test",
+                "api_base": format!("http://{addr}/backend-api/codex")
+            }),
+            metadata: json!({}),
+            labels: vec![],
+            tags: BTreeMap::new(),
+        };
+        let validated = provider
+            .validate_credentials(&envelope)
+            .await
+            .expect("validated");
+
+        let snapshot = provider
+            .probe_quota(&envelope, &validated)
+            .await
+            .expect("quota snapshot");
+        assert_eq!(snapshot.plan_label.as_deref(), Some("team"));
+        assert_eq!(snapshot.remaining_requests_hint, None);
+        assert_eq!(
+            snapshot.details.as_ref().and_then(|value| {
+                value
+                    .pointer("/rate_limit/primary_window/used_percent")
+                    .and_then(Value::as_u64)
+            }),
+            Some(12)
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_quota_maps_limit_reached_to_zero_remaining_requests() {
+        let addr = spawn_wham_usage_server(true).await;
+        let provider = OpenAiCodexProvider::shared(Arc::new(PlatformStore::demo()));
+        let envelope = ProviderAccountEnvelope {
+            provider: "openai_codex".to_string(),
+            credential_kind: "oauth_tokens".to_string(),
+            payload_version: "v1".to_string(),
+            credentials: json!({
+                "access_token": "test-token",
+                "account_id": "acct_test",
+                "api_base": format!("http://{addr}/backend-api/codex")
+            }),
+            metadata: json!({}),
+            labels: vec![],
+            tags: BTreeMap::new(),
+        };
+        let validated = provider
+            .validate_credentials(&envelope)
+            .await
+            .expect("validated");
+
+        let snapshot = provider
+            .probe_quota(&envelope, &validated)
+            .await
+            .expect("quota snapshot");
+        assert_eq!(snapshot.plan_label.as_deref(), Some("team"));
+        assert_eq!(snapshot.remaining_requests_hint, Some(0));
+        assert_eq!(
+            snapshot.details.as_ref().and_then(|value| {
+                value
+                    .pointer("/rate_limit/primary_window/reset_after_seconds")
+                    .and_then(Value::as_u64)
+            }),
+            Some(120)
+        );
     }
 
     #[tokio::test]
