@@ -13,7 +13,8 @@ use axum::{
 use futures::StreamExt;
 use protocol_core::{
     CanonicalMessage, ContentPart, FinishReason, FrontendProtocol, InferenceRequest,
-    InferenceResponse, MessageRole, ModelCapability, StreamEventKind, ToolCall, ToolDefinition,
+    InferenceResponse, MessageRole, ModelCapability, ReasoningConfig, StreamEventKind, ToolCall,
+    ToolDefinition,
 };
 use provider_core::{ProviderError, ProviderErrorKind, ProviderRegistry};
 use provider_openai_codex::OpenAiCodexProvider;
@@ -157,6 +158,7 @@ async fn chat_completions(
         public_model: request.model.clone(),
         upstream_model: Some(route_group.upstream_model),
         previous_response_id: None,
+        reasoning: request.reasoning.clone(),
         stream: request.stream,
         messages: request
             .messages
@@ -363,6 +365,7 @@ async fn responses(
         public_model: request.model.clone(),
         upstream_model: Some(route_group.upstream_model),
         previous_response_id: request.previous_response_id.clone(),
+        reasoning: request.reasoning.clone(),
         stream: request.stream,
         messages: responses_input_to_messages(request.input),
         tools: responses_tools_to_canonical_tools(&request.tools),
@@ -1246,6 +1249,8 @@ struct ChatCompletionRequest {
     #[serde(default)]
     tools: Vec<OpenAiToolDefinition>,
     #[serde(default)]
+    reasoning: Option<ReasoningConfig>,
+    #[serde(default)]
     stream: bool,
 }
 
@@ -1257,6 +1262,8 @@ struct ResponsesRequest {
     previous_response_id: Option<String>,
     #[serde(default)]
     tools: Vec<ResponsesToolDefinition>,
+    #[serde(default)]
+    reasoning: Option<ReasoningConfig>,
     #[serde(default)]
     stream: bool,
 }
@@ -1745,6 +1752,50 @@ mod tests {
             let payload = concat!(
                 "event: response.completed\n",
                 "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_tool_result_123\",\"model\":\"gpt-5.1-codex\",\"output\":[{\"id\":\"msg_tool_result_123\",\"type\":\"message\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"annotations\":[],\"text\":\"Shanghai is 25C.\"}],\"role\":\"assistant\"}],\"usage\":{\"input_tokens\":14,\"output_tokens\":4,\"total_tokens\":18}}}\n\n"
+            );
+
+            ([(http::header::CONTENT_TYPE, "text/event-stream")], payload).into_response()
+        }
+
+        let app = Router::new()
+            .route(
+                "/backend-api/codex/responses",
+                post(codex_responses_handler),
+            )
+            .fallback(|| async { (StatusCode::NOT_FOUND, Body::empty()) });
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+        addr
+    }
+
+    async fn spawn_codex_reasoning_server() -> SocketAddr {
+        async fn codex_responses_handler(request: AxumRequest) -> impl IntoResponse {
+            let auth = request
+                .headers()
+                .get(http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            let body = to_bytes(request.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            let body: Value = serde_json::from_slice(&body).expect("json body");
+
+            assert_eq!(auth, "Bearer gateway-codex-token");
+            assert_eq!(
+                body.pointer("/reasoning/effort").and_then(Value::as_str),
+                Some("xhigh")
+            );
+
+            let payload = concat!(
+                "event: response.completed\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_reasoning_123\",\"model\":\"gpt-5.1-codex\",\"output\":[{\"id\":\"msg_reasoning_123\",\"type\":\"message\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"annotations\":[],\"text\":\"reasoned\"}],\"role\":\"assistant\"}],\"usage\":{\"input_tokens\":8,\"output_tokens\":2,\"total_tokens\":10}}}\n\n"
             );
 
             ([(http::header::CONTENT_TYPE, "text/event-stream")], payload).into_response()
@@ -3145,6 +3196,95 @@ mod tests {
             body.pointer("/output/0/content/0/text")
                 .and_then(Value::as_str),
             Some("Shanghai is 25C.")
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_completions_forward_reasoning_effort_to_codex_responses() {
+        let addr = spawn_codex_reasoning_server().await;
+        let state = state_with_codex_route(&format!("http://{addr}/backend-api/codex")).await;
+        let app = app(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/v1/chat/completions")
+                    .header(http::header::AUTHORIZATION, "Bearer fgk_demo_gateway_key")
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "gpt-5-codex",
+                            "reasoning": {
+                                "effort": "xhigh"
+                            },
+                            "messages": [{
+                                "role": "user",
+                                "content": "hello"
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(
+            body.pointer("/choices/0/message/content")
+                .and_then(Value::as_str),
+            Some("reasoned")
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_forward_reasoning_effort_to_codex_responses() {
+        let addr = spawn_codex_reasoning_server().await;
+        let state = state_with_codex_route(&format!("http://{addr}/backend-api/codex")).await;
+        let app = app(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/v1/responses")
+                    .header(http::header::AUTHORIZATION, "Bearer fgk_demo_gateway_key")
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "gpt-5-codex",
+                            "reasoning": {
+                                "effort": "xhigh"
+                            },
+                            "input": [{
+                                "role": "user",
+                                "content": [{
+                                    "type": "input_text",
+                                    "text": "hello"
+                                }]
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(
+            body.pointer("/output/0/content/0/text")
+                .and_then(Value::as_str),
+            Some("reasoned")
         );
     }
 

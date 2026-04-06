@@ -33,6 +33,11 @@ pub struct ToolDefinition {
     pub parameters: Value,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReasoningConfig {
+    pub effort: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolCall {
     pub id: String,
@@ -59,6 +64,8 @@ pub struct InferenceRequest {
     pub upstream_model: Option<String>,
     #[serde(default)]
     pub previous_response_id: Option<String>,
+    #[serde(default)]
+    pub reasoning: Option<ReasoningConfig>,
     pub stream: bool,
     pub messages: Vec<CanonicalMessage>,
     #[serde(default)]

@@ -211,6 +211,7 @@ mod tests {
     use futures::stream;
     use protocol_core::{
         FrontendProtocol, InferenceRequest, InferenceResponse, ModelCapability, ModelDescriptor,
+        ReasoningConfig,
     };
 
     struct DummyProvider;
@@ -315,6 +316,9 @@ mod tests {
                 public_model: "dummy-model".to_string(),
                 upstream_model: None,
                 previous_response_id: None,
+                reasoning: Some(ReasoningConfig {
+                    effort: "low".to_string(),
+                }),
                 stream: false,
                 messages: vec![],
                 tools: vec![],

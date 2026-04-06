@@ -395,6 +395,14 @@ impl OpenAiCodexProvider {
         request.tools.iter().map(tool_payload).collect()
     }
 
+    fn apply_reasoning_config(payload: &mut Value, request: &InferenceRequest) {
+        if let Some(reasoning) = &request.reasoning {
+            payload["reasoning"] = json!({
+                "effort": reasoning.effort
+            });
+        }
+    }
+
     fn message_parts(message: &protocol_core::CanonicalMessage) -> Vec<ContentPart> {
         if !message.parts.is_empty() {
             return message.parts.clone();
@@ -628,14 +636,16 @@ impl OpenAiCodexProvider {
         let model = self.effective_model(request, connection);
         let tools = Self::tool_payloads(request);
         let payload = if Self::uses_chatgpt_codex_endpoint(connection) {
-            json!({
+            let mut payload = json!({
                 "model": model,
                 "instructions": Self::codex_instructions(request),
                 "input": Self::codex_input_items(request),
                 "tools": tools,
                 "stream": true,
                 "store": false
-            })
+            });
+            Self::apply_reasoning_config(&mut payload, request);
+            payload
         } else {
             let mut payload = json!({
                 "model": model,
@@ -646,6 +656,7 @@ impl OpenAiCodexProvider {
             if let Some(previous_response_id) = &request.previous_response_id {
                 payload["previous_response_id"] = Value::String(previous_response_id.clone());
             }
+            Self::apply_reasoning_config(&mut payload, request);
             payload
         };
 
@@ -2629,6 +2640,7 @@ mod tests {
             public_model: "gpt-4.1-mini".to_string(),
             upstream_model: Some("gpt-4.1-mini".to_string()),
             previous_response_id: None,
+            reasoning: None,
             stream: false,
             messages: vec![protocol_core::CanonicalMessage {
                 role: protocol_core::MessageRole::User,
@@ -2997,6 +3009,55 @@ mod tests {
         assert_eq!(response.finish_reason, FinishReason::Stop);
         assert_eq!(response.output_text, "Shanghai is 25C.");
         assert!(response.tool_calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn responses_on_codex_endpoint_forwards_reasoning_effort() {
+        async fn codex_responses_handler(request: Request) -> impl IntoResponse {
+            let body = axum::body::to_bytes(request.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            let body: Value = serde_json::from_slice(&body).expect("json body");
+
+            assert_eq!(
+                body.pointer("/reasoning/effort").and_then(Value::as_str),
+                Some("xhigh")
+            );
+
+            let payload = concat!(
+                "event: response.completed\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_reasoning_123\",\"model\":\"gpt-5.1-codex\",\"output\":[{\"id\":\"msg_reasoning_123\",\"type\":\"message\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"annotations\":[],\"text\":\"reasoned\"}],\"role\":\"assistant\"}],\"usage\":{\"input_tokens\":6,\"output_tokens\":2,\"total_tokens\":8}}}\n\n"
+            );
+
+            ([(http::header::CONTENT_TYPE, "text/event-stream")], payload).into_response()
+        }
+
+        let app = Router::new()
+            .route(
+                "/backend-api/codex/responses",
+                post(codex_responses_handler),
+            )
+            .fallback(|| async { (HttpStatusCode::NOT_FOUND, Body::empty()) });
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+
+        let (provider, mut request, _) =
+            setup_provider(&format!("http://{addr}/backend-api/codex")).await;
+        request.public_model = "gpt-5.4".to_string();
+        request.upstream_model = Some("gpt-5.4".to_string());
+        request.reasoning = Some(protocol_core::ReasoningConfig {
+            effort: "xhigh".to_string(),
+        });
+
+        let response = provider.responses(request).await.expect("responses");
+
+        assert_eq!(response.output_text, "reasoned");
     }
 
     #[tokio::test]
