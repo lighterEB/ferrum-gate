@@ -138,6 +138,46 @@ Security note:
 - `/internal/*` and `/external/*` -> `control-plane`
 - `tenant-api` and `control-plane` should still usually be restricted by firewall, reverse proxy auth, or source IP allowlists if they are reachable from untrusted networks
 
+## GHCR VPS Deployment
+
+If you do not want to keep the source tree on the VPS, use the published GHCR images instead.
+
+The repository now includes:
+
+- `.github/workflows/publish-images.yml` to build and publish backend images on every push to `main`
+- `docker-compose.vps.yml` for image-based deployment
+- `vps.env.example` for the VPS runtime environment
+
+Images published to GHCR:
+
+- `ghcr.io/lightereb/ferrum-gate-gateway-http:latest`
+- `ghcr.io/lightereb/ferrum-gate-tenant-api:latest`
+- `ghcr.io/lightereb/ferrum-gate-control-plane:latest`
+- `ghcr.io/lightereb/ferrum-gate-nginx:latest`
+
+On the VPS:
+
+```bash
+mkdir -p /opt/ferrum-gate
+cd /opt/ferrum-gate
+curl -O https://raw.githubusercontent.com/lighterEB/ferrum-gate/main/docker-compose.vps.yml
+curl -O https://raw.githubusercontent.com/lighterEB/ferrum-gate/main/vps.env.example
+cp vps.env.example .env
+```
+
+Edit `.env`, then start:
+
+```bash
+docker compose -f docker-compose.vps.yml --env-file .env pull
+docker compose -f docker-compose.vps.yml --env-file .env up -d
+```
+
+If the repository or package visibility requires authentication, log in first:
+
+```bash
+echo <GHCR_PAT> | docker login ghcr.io -u <github-username> --password-stdin
+```
+
 ## Tenant Console
 
 The tenant self-service console lives in `web/tenant-console` and is managed with Bun.

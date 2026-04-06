@@ -1,0 +1,70 @@
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-ferrum_gate}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ferrum_gate}
+      POSTGRES_USER: ${POSTGRES_USER:-ferrum_gate}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ferrum_gate} -d ${POSTGRES_DB:-ferrum_gate}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  gateway-http:
+    image: ${GATEWAY_HTTP_IMAGE:-ghcr.io/lightereb/ferrum-gate-gateway-http:latest}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgres://ferrum_gate:ferrum_gate@postgres:5432/ferrum_gate}
+      FERRUMGATE_MASTER_KEY: ${FERRUMGATE_MASTER_KEY:-change-me}
+      FERRUMGATE_SEED_DEMO_DATA: ${FERRUMGATE_SEED_DEMO_DATA:-true}
+      FERRUMGATE_GATEWAY_HTTP_ADDR: 0.0.0.0:3005
+      FERRUMGATE_TENANT_API_ALLOWED_ORIGINS: ${FERRUMGATE_TENANT_API_ALLOWED_ORIGINS:-}
+      FERRUMGATE_CONSOLE_ALLOWED_ORIGINS: ${FERRUMGATE_CONSOLE_ALLOWED_ORIGINS:-}
+
+  tenant-api:
+    image: ${TENANT_API_IMAGE:-ghcr.io/lightereb/ferrum-gate-tenant-api:latest}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgres://ferrum_gate:ferrum_gate@postgres:5432/ferrum_gate}
+      FERRUMGATE_MASTER_KEY: ${FERRUMGATE_MASTER_KEY:-change-me}
+      FERRUMGATE_SEED_DEMO_DATA: ${FERRUMGATE_SEED_DEMO_DATA:-true}
+      FERRUMGATE_TENANT_API_ADDR: 0.0.0.0:3006
+      FERRUMGATE_TENANT_API_ALLOWED_ORIGINS: ${FERRUMGATE_TENANT_API_ALLOWED_ORIGINS:-}
+
+  control-plane:
+    image: ${CONTROL_PLANE_IMAGE:-ghcr.io/lightereb/ferrum-gate-control-plane:latest}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgres://ferrum_gate:ferrum_gate@postgres:5432/ferrum_gate}
+      FERRUMGATE_MASTER_KEY: ${FERRUMGATE_MASTER_KEY:-change-me}
+      FERRUMGATE_SEED_DEMO_DATA: ${FERRUMGATE_SEED_DEMO_DATA:-true}
+      FERRUMGATE_CONTROL_PLANE_ADDR: 0.0.0.0:3007
+      FERRUMGATE_TENANT_API_ALLOWED_ORIGINS: ${FERRUMGATE_TENANT_API_ALLOWED_ORIGINS:-}
+      FERRUMGATE_CONSOLE_ALLOWED_ORIGINS: ${FERRUMGATE_CONSOLE_ALLOWED_ORIGINS:-}
+
+  nginx:
+    image: ${NGINX_IMAGE:-ghcr.io/lightereb/ferrum-gate-nginx:latest}
+    restart: unless-stopped
+    depends_on:
+      - gateway-http
+      - tenant-api
+      - control-plane
+    ports:
+      - "${NGINX_PORT:-80}:80"
+
+volumes:
+  postgres_data:
+
