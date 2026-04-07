@@ -12,8 +12,6 @@ type RuntimeEnv = {
 	VITE_DEV_CONTROL_PLANE_TOKEN?: string;
 };
 
-export const PROXY_AUTH_TOKEN = "__proxy_auth__";
-
 function isLoopbackHost(hostname: string) {
 	return (
 		hostname === "127.0.0.1" || hostname === "localhost" || hostname === "::1"

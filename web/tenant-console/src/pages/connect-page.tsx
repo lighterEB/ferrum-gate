@@ -34,7 +34,7 @@ import {
 	getDefaultControlPlaneBaseUrl,
 	getDefaultGatewayBaseUrl,
 	getDefaultTenantApiBaseUrl,
-	PROXY_AUTH_TOKEN,
+	isDevRuntime,
 } from "@/lib/env";
 import { getGatewayHealth } from "@/lib/gateway-api";
 import {
@@ -71,6 +71,7 @@ function hostLabel(value: string, fallback: string) {
 export function ConnectPage() {
 	const { t } = useTranslation();
 	const navigate = useNavigate({ from: "/connect" });
+	const isDev = isDevRuntime();
 	const tenantApiBaseUrl = sanitizeTenantApiBaseUrl(
 		getDefaultTenantApiBaseUrl(),
 	);
@@ -83,17 +84,11 @@ export function ConnectPage() {
 	const consoleSecretToken = getConsoleSecretToken();
 	const consoleUsername = getConsoleUsername();
 	const consolePassword = getConsolePassword();
+
 	const hasSecretTokenLogin = Boolean(consoleSecretToken);
-	const hasPasswordLogin = Boolean(consoleUsername && consolePassword);
-	const usesServerSideProxyAuth = Boolean(
-		gatewayBaseUrl &&
-			tenantApiBaseUrl === "" &&
-			controlPlaneBaseUrl === "" &&
-			!tenantManagementToken &&
-			!controlPlaneToken &&
-			!hasSecretTokenLogin &&
-			!hasPasswordLogin,
-	);
+	const hasPasswordLogin =
+		Boolean(consoleUsername && consolePassword) || !isDev;
+
 	const [loginMode, setLoginMode] = useState<LoginMode>(
 		hasSecretTokenLogin ? "token" : "password",
 	);
@@ -104,14 +99,15 @@ export function ConnectPage() {
 			password: "",
 		},
 	});
+
 	const environmentReady = Boolean(
 		gatewayBaseUrl &&
-			((tenantApiBaseUrl &&
-				controlPlaneBaseUrl &&
-				tenantManagementToken &&
-				controlPlaneToken &&
-				(hasSecretTokenLogin || hasPasswordLogin)) ||
-				usesServerSideProxyAuth),
+			(isDev
+				? tenantApiBaseUrl &&
+					controlPlaneBaseUrl &&
+					tenantManagementToken &&
+					controlPlaneToken
+				: true),
 	);
 
 	return (
@@ -184,7 +180,10 @@ export function ConnectPage() {
 									return;
 								}
 
-								if (!usesServerSideProxyAuth && loginMode === "token") {
+								let currentTenantToken = tenantManagementToken;
+								let currentControlPlaneToken = controlPlaneToken;
+
+								if (loginMode === "token") {
 									const candidate = values.secretToken.trim();
 
 									if (!candidate) {
@@ -194,11 +193,19 @@ export function ConnectPage() {
 										return;
 									}
 
-									if (!consoleSecretToken || candidate !== consoleSecretToken) {
+									if (
+										isDev &&
+										(!consoleSecretToken || candidate !== consoleSecretToken)
+									) {
 										toast.error(t("connect.errors.invalidConsoleCredentials"));
 										return;
 									}
-								} else if (!usesServerSideProxyAuth) {
+
+									if (!isDev) {
+										currentTenantToken = `Bearer ${candidate}`;
+										currentControlPlaneToken = `Bearer ${candidate}`;
+									}
+								} else {
 									const username = values.username.trim();
 									const password = values.password.trim();
 
@@ -217,24 +224,24 @@ export function ConnectPage() {
 									}
 
 									if (
-										!consoleUsername ||
-										!consolePassword ||
-										username !== consoleUsername ||
-										password !== consolePassword
+										isDev &&
+										(!consoleUsername ||
+											!consolePassword ||
+											username !== consoleUsername ||
+											password !== consolePassword)
 									) {
 										toast.error(t("connect.errors.invalidConsoleCredentials"));
 										return;
 									}
+
+									if (!isDev) {
+										const basicAuth = `Basic ${btoa(`${username}:${password}`)}`;
+										currentTenantToken = basicAuth;
+										currentControlPlaneToken = basicAuth;
+									}
 								}
 
 								try {
-									const currentTenantToken = usesServerSideProxyAuth
-										? PROXY_AUTH_TOKEN
-										: tenantManagementToken;
-									const currentControlPlaneToken = usesServerSideProxyAuth
-										? PROXY_AUTH_TOKEN
-										: controlPlaneToken;
-
 									await Promise.all([
 										getTenantMe(tenantApiBaseUrl, currentTenantToken),
 										listProviderAccounts(
@@ -257,6 +264,7 @@ export function ConnectPage() {
 									toast.success(t("connect.toast.success"));
 									await navigate({ to: "/dashboard" });
 								} catch (error) {
+									console.error("ERROR IN SUBMIT:", error);
 									toast.error(
 										error instanceof Error &&
 											error.name === "ControlPlaneApiError"
@@ -266,9 +274,7 @@ export function ConnectPage() {
 								}
 							})}
 						>
-							{!usesServerSideProxyAuth &&
-							hasSecretTokenLogin &&
-							loginMode === "token" ? (
+							{hasSecretTokenLogin && loginMode === "token" ? (
 								<FormField
 									control={form.control}
 									name="secretToken"
@@ -292,9 +298,7 @@ export function ConnectPage() {
 									)}
 								/>
 							) : null}
-							{!usesServerSideProxyAuth &&
-							hasPasswordLogin &&
-							loginMode === "password" ? (
+							{hasPasswordLogin && loginMode === "password" ? (
 								<>
 									<FormField
 										control={form.control}

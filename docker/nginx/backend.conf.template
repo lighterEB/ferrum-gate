@@ -20,22 +20,21 @@ server {
     }
 
     location = / {
-        auth_basic "FerrumGate Console";
-        auth_basic_user_file /etc/nginx/.htpasswd;
+
         root /usr/share/nginx/html;
         try_files /index.html =404;
     }
 
     location / {
-        auth_basic "FerrumGate Console";
-        auth_basic_user_file /etc/nginx/.htpasswd;
+
         root /usr/share/nginx/html;
         try_files $uri $uri/ /index.html;
     }
 
     location /tenant/ {
-        auth_basic "FerrumGate Console";
-        auth_basic_user_file /etc/nginx/.htpasswd;
+        if ($http_authorization != "${EXPECTED_AUTH_HEADER}") {
+            return 401 '{"error": {"code": "unauthorized", "message": "Invalid console credentials"}}';
+        }
         proxy_pass http://tenant-api:3006;
         proxy_http_version 1.1;
         proxy_read_timeout 300s;
@@ -47,8 +46,9 @@ server {
     }
 
     location /internal/ {
-        auth_basic "FerrumGate Console";
-        auth_basic_user_file /etc/nginx/.htpasswd;
+        if ($http_authorization != "${EXPECTED_AUTH_HEADER}") {
+            return 401 '{"error": {"code": "unauthorized", "message": "Invalid console credentials"}}';
+        }
         proxy_pass http://control-plane:3007;
         proxy_http_version 1.1;
         proxy_read_timeout 300s;
@@ -60,8 +60,9 @@ server {
     }
 
     location /external/ {
-        auth_basic "FerrumGate Console";
-        auth_basic_user_file /etc/nginx/.htpasswd;
+        if ($http_authorization != "${EXPECTED_AUTH_HEADER}") {
+            return 401 '{"error": {"code": "unauthorized", "message": "Invalid console credentials"}}';
+        }
         proxy_pass http://control-plane:3007;
         proxy_http_version 1.1;
         proxy_read_timeout 300s;

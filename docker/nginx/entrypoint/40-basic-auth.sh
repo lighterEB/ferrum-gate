@@ -6,4 +6,4 @@ if [ -z "${CONSOLE_BASIC_AUTH_USERNAME:-}" ] || [ -z "${CONSOLE_BASIC_AUTH_PASSW
   exit 1
 fi
 
-htpasswd -bc /etc/nginx/.htpasswd "$CONSOLE_BASIC_AUTH_USERNAME" "$CONSOLE_BASIC_AUTH_PASSWORD"
+export EXPECTED_AUTH_HEADER="Basic $(printf "%s:%s" "$CONSOLE_BASIC_AUTH_USERNAME" "$CONSOLE_BASIC_AUTH_PASSWORD" | base64 | tr -d '\n')"

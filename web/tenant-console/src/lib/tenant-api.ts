@@ -53,8 +53,12 @@ type RequestOptions = {
 
 function authorizationHeader(token: string) {
 	const sanitized = token.trim();
-	if (!sanitized || sanitized === "__proxy_auth__") {
+	if (!sanitized) {
 		return null;
+	}
+
+	if (sanitized.startsWith("Basic ")) {
+		return sanitized;
 	}
 
 	return `Bearer ${sanitized}`;

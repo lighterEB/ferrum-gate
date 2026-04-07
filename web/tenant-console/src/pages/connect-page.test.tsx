@@ -170,7 +170,7 @@ describe("connect page", () => {
 		});
 	});
 
-	it("connects through same-origin proxy auth without browser-visible secrets", async () => {
+	it("supports CRM-style password login without browser-visible secrets in proxy mode", async () => {
 		const user = userEvent.setup();
 		vi.stubEnv("DEV", false);
 		vi.stubEnv("VITE_DEFAULT_TENANT_API_BASE_URL", "");
@@ -184,7 +184,7 @@ describe("connect page", () => {
 
 		server.use(
 			http.get("/tenant/v1/me", ({ request }) => {
-				expect(request.headers.get("authorization")).toBeNull();
+				expect(request.headers.get("authorization")).toBe("Basic dXNlcjpwYXNz");
 
 				return HttpResponse.json({
 					id: "tenant_1",
@@ -195,7 +195,7 @@ describe("connect page", () => {
 				});
 			}),
 			http.get("/internal/v1/runtime/provider-accounts", ({ request }) => {
-				expect(request.headers.get("authorization")).toBeNull();
+				expect(request.headers.get("authorization")).toBe("Basic dXNlcjpwYXNz");
 				return HttpResponse.json({ data: [] });
 			}),
 			http.get("/internal/v1/alerts/outbox", () =>
@@ -214,12 +214,15 @@ describe("connect page", () => {
 			name: i18n.t("common.connect"),
 		});
 
-		expect(
-			screen.queryByLabelText(i18n.t("connect.fields.secretToken.label")),
-		).not.toBeInTheDocument();
-		expect(
-			screen.queryByLabelText(i18n.t("connect.fields.username.label")),
-		).not.toBeInTheDocument();
+		// Explicitly confirm we still show the form in VPS proxy mode
+		await user.type(
+			screen.getByLabelText(i18n.t("connect.fields.username.label")),
+			"user",
+		);
+		await user.type(
+			screen.getByLabelText(i18n.t("connect.fields.password.label")),
+			"pass",
+		);
 
 		await user.click(connectButton);
 
