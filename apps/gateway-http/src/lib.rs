@@ -365,7 +365,7 @@ async fn responses(
         previous_response_id: request.previous_response_id.clone(),
         stream: request.stream,
         messages: responses_input_to_messages(request.input),
-        tools: openai_tools_to_canonical_tools(&request.tools),
+        tools: responses_tools_to_canonical_tools(&request.tools),
         metadata: BTreeMap::from([
             (
                 "provider_account_id".to_string(),
@@ -652,6 +652,29 @@ fn openai_tools_to_canonical_tools(tools: &[OpenAiToolDefinition]) -> Vec<ToolDe
             name: tool.function.name.clone(),
             description: tool.function.description.clone(),
             parameters: tool.function.parameters.clone(),
+        })
+        .collect()
+}
+
+fn responses_tools_to_canonical_tools(tools: &[ResponsesToolDefinition]) -> Vec<ToolDefinition> {
+    tools
+        .iter()
+        .filter_map(|tool| match tool {
+            ResponsesToolDefinition::Flat(tool) if tool.tool_type == "function" => {
+                Some(ToolDefinition {
+                    name: tool.name.clone(),
+                    description: tool.description.clone(),
+                    parameters: tool.parameters.clone(),
+                })
+            }
+            ResponsesToolDefinition::Nested(tool) if tool.tool_type == "function" => {
+                Some(ToolDefinition {
+                    name: tool.function.name.clone(),
+                    description: tool.function.description.clone(),
+                    parameters: tool.function.parameters.clone(),
+                })
+            }
+            _ => None,
         })
         .collect()
 }
@@ -1230,10 +1253,10 @@ struct ChatCompletionRequest {
 struct ResponsesRequest {
     model: String,
     input: Value,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_string_placeholder")]
     previous_response_id: Option<String>,
     #[serde(default)]
-    tools: Vec<OpenAiToolDefinition>,
+    tools: Vec<ResponsesToolDefinition>,
     #[serde(default)]
     stream: bool,
 }
@@ -1280,6 +1303,24 @@ struct OpenAiToolDefinition {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+enum ResponsesToolDefinition {
+    Flat(FlatResponsesToolDefinition),
+    Nested(OpenAiToolDefinition),
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct FlatResponsesToolDefinition {
+    #[serde(rename = "type")]
+    tool_type: String,
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    parameters: Value,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 struct OpenAiFunctionDefinition {
     name: String,
     #[serde(default)]
@@ -1300,6 +1341,22 @@ struct OpenAiToolCall {
 struct OpenAiFunctionCall {
     name: String,
     arguments: String,
+}
+
+fn deserialize_optional_string_placeholder<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| {
+        if value == "[undefined]" {
+            None
+        } else {
+            Some(value)
+        }
+    }))
 }
 
 #[cfg(test)]
@@ -1548,6 +1605,64 @@ mod tests {
             let payload = concat!(
                 "event: response.completed\n",
                 "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_tool_result_123\",\"model\":\"gpt-5.1-codex\",\"output\":[{\"id\":\"msg_tool_result_123\",\"type\":\"message\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"annotations\":[],\"text\":\"Shanghai is 25C.\"}],\"role\":\"assistant\"}],\"usage\":{\"input_tokens\":14,\"output_tokens\":4,\"total_tokens\":18}}}\n\n"
+            );
+
+            ([(http::header::CONTENT_TYPE, "text/event-stream")], payload).into_response()
+        }
+
+        let app = Router::new()
+            .route(
+                "/backend-api/codex/responses",
+                post(codex_responses_handler),
+            )
+            .fallback(|| async { (StatusCode::NOT_FOUND, Body::empty()) });
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+        addr
+    }
+
+    async fn spawn_codex_empty_completed_output_server() -> SocketAddr {
+        async fn codex_responses_handler(request: AxumRequest) -> impl IntoResponse {
+            let auth = request
+                .headers()
+                .get(http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            let body = to_bytes(request.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            let body: Value = serde_json::from_slice(&body).expect("json body");
+
+            assert_eq!(auth, "Bearer gateway-codex-token");
+            assert_eq!(body.get("stream").and_then(Value::as_bool), Some(true),);
+            assert_eq!(
+                body.pointer("/input/0/content/0/text")
+                    .and_then(Value::as_str),
+                Some("Reply with exactly: pong")
+            );
+
+            let payload = concat!(
+                "event: response.created\n",
+                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_pong_123\",\"model\":\"gpt-5.1-codex\",\"output\":[]}}\n\n",
+                "event: response.output_item.added\n",
+                "data: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"msg_pong_123\",\"type\":\"message\",\"status\":\"in_progress\",\"content\":[],\"role\":\"assistant\"},\"output_index\":0}\n\n",
+                "event: response.content_part.added\n",
+                "data: {\"type\":\"response.content_part.added\",\"content_index\":0,\"item_id\":\"msg_pong_123\",\"output_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"\"}}\n\n",
+                "event: response.output_text.delta\n",
+                "data: {\"type\":\"response.output_text.delta\",\"content_index\":0,\"delta\":\"pong\",\"item_id\":\"msg_pong_123\",\"output_index\":0}\n\n",
+                "event: response.output_text.done\n",
+                "data: {\"type\":\"response.output_text.done\",\"content_index\":0,\"item_id\":\"msg_pong_123\",\"output_index\":0,\"text\":\"pong\"}\n\n",
+                "event: response.output_item.done\n",
+                "data: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"msg_pong_123\",\"type\":\"message\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"pong\"}],\"role\":\"assistant\"},\"output_index\":0}\n\n",
+                "event: response.completed\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_pong_123\",\"model\":\"gpt-5.1-codex\",\"output\":[],\"usage\":{\"input_tokens\":20,\"output_tokens\":5,\"total_tokens\":25}}}\n\n"
             );
 
             ([(http::header::CONTENT_TYPE, "text/event-stream")], payload).into_response()
@@ -2763,6 +2878,145 @@ mod tests {
         assert_eq!(
             body.pointer("/output/0/arguments").and_then(Value::as_str),
             Some("{\"city\":\"Shanghai\"}")
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_accepts_flat_function_tools_and_undefined_previous_response_id() {
+        let addr = spawn_codex_tool_call_server().await;
+        let state = state_with_codex_route(&format!("http://{addr}/backend-api/codex")).await;
+        let app = app(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/v1/responses")
+                    .header(http::header::AUTHORIZATION, "Bearer fgk_demo_gateway_key")
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "gpt-5-codex",
+                            "previous_response_id": "[undefined]",
+                            "input": [{
+                                "type": "message",
+                                "role": "user",
+                                "content": [
+                                    { "type": "input_text", "text": "What is the weather in Shanghai?" },
+                                    {
+                                        "type": "input_image",
+                                        "image_url": "https://example.com/weather.png"
+                                    }
+                                ]
+                            }],
+                            "tools": [{
+                                "type": "function",
+                                "name": "get_weather",
+                                "description": "Fetch current weather",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "city": { "type": "string" }
+                                    },
+                                    "required": ["city"]
+                                }
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(
+            body.pointer("/output/0/name").and_then(Value::as_str),
+            Some("get_weather")
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_non_stream_uses_streamed_text_when_completed_payload_omits_output() {
+        let addr = spawn_codex_empty_completed_output_server().await;
+        let state = state_with_codex_route(&format!("http://{addr}/backend-api/codex")).await;
+        let app = app(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/v1/responses")
+                    .header(http::header::AUTHORIZATION, "Bearer fgk_demo_gateway_key")
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "gpt-5-codex",
+                            "stream": false,
+                            "input": "Reply with exactly: pong"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(
+            body.pointer("/output/0/content/0/text")
+                .and_then(Value::as_str),
+            Some("pong")
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_stream_completed_payload_uses_streamed_text_when_completed_output_is_empty()
+    {
+        let addr = spawn_codex_empty_completed_output_server().await;
+        let state = state_with_codex_route(&format!("http://{addr}/backend-api/codex")).await;
+        let app = app(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/v1/responses")
+                    .header(http::header::AUTHORIZATION, "Bearer fgk_demo_gateway_key")
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "gpt-5-codex",
+                            "stream": true,
+                            "input": "Reply with exactly: pong"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body = String::from_utf8_lossy(&body);
+        let completed = sse_event_payloads(&body, "response.completed");
+        assert_eq!(completed.len(), 1);
+        assert_eq!(
+            completed[0]
+                .pointer("/response/output/0/content/0/text")
+                .and_then(Value::as_str),
+            Some("pong")
         );
     }
 

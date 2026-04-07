@@ -837,7 +837,7 @@ impl OpenAiCodexProvider {
                                     provider_kind.clone(),
                                     &message.data,
                                 ) {
-                                    Ok(payload) => payload,
+                                    Ok(payload) => merge_streamed_completion_output(payload, &output),
                                     Err(error) => {
                                         yield Err(error);
                                         return;
@@ -1635,6 +1635,28 @@ fn parse_responses_completion_payload(
     ))
 }
 
+fn merge_streamed_completion_output(
+    mut response: InferenceResponse,
+    streamed_output_text: &str,
+) -> InferenceResponse {
+    if response.output_text.is_empty() && !streamed_output_text.is_empty() {
+        response.output_text = streamed_output_text.to_string();
+        if response.usage.output_tokens == 0 || response.usage.total_tokens == 0 {
+            let estimated = estimate_usage(streamed_output_text);
+            if response.usage.output_tokens == 0 {
+                response.usage.output_tokens = estimated.output_tokens;
+            }
+            if response.usage.total_tokens == 0 {
+                response.usage.total_tokens = response
+                    .usage
+                    .input_tokens
+                    .saturating_add(response.usage.output_tokens);
+            }
+        }
+    }
+    response
+}
+
 fn usage_from_api(usage: ApiUsage) -> TokenUsage {
     let input_tokens = usage
         .input_tokens
@@ -2292,6 +2314,64 @@ mod tests {
                 "<html><body>Enable JavaScript and cookies to continue</body></html>",
             )
                 .into_response()
+        }
+
+        let app = Router::new()
+            .route(
+                "/backend-api/codex/responses",
+                post(codex_responses_handler),
+            )
+            .fallback(|| async { (HttpStatusCode::NOT_FOUND, Body::empty()) });
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+        addr
+    }
+
+    async fn spawn_codex_empty_completed_output_server() -> SocketAddr {
+        async fn codex_responses_handler(request: Request) -> impl IntoResponse {
+            let auth = request
+                .headers()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            let body = axum::body::to_bytes(request.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            let body: Value = serde_json::from_slice(&body).expect("json body");
+
+            assert_eq!(auth, "Bearer test-token");
+            assert_eq!(body.get("stream").and_then(Value::as_bool), Some(true));
+            assert_eq!(
+                body.pointer("/input/0/content/0/text")
+                    .and_then(Value::as_str),
+                Some("hello")
+            );
+
+            let payload = concat!(
+                "event: response.created\n",
+                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_pong_123\",\"model\":\"gpt-5.1-codex\",\"output\":[]}}\n\n",
+                "event: response.output_item.added\n",
+                "data: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"msg_pong_123\",\"type\":\"message\",\"status\":\"in_progress\",\"content\":[],\"role\":\"assistant\"},\"output_index\":0}\n\n",
+                "event: response.content_part.added\n",
+                "data: {\"type\":\"response.content_part.added\",\"content_index\":0,\"item_id\":\"msg_pong_123\",\"output_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"\"}}\n\n",
+                "event: response.output_text.delta\n",
+                "data: {\"type\":\"response.output_text.delta\",\"content_index\":0,\"delta\":\"pong\",\"item_id\":\"msg_pong_123\",\"output_index\":0}\n\n",
+                "event: response.output_text.done\n",
+                "data: {\"type\":\"response.output_text.done\",\"content_index\":0,\"item_id\":\"msg_pong_123\",\"output_index\":0,\"text\":\"pong\"}\n\n",
+                "event: response.output_item.done\n",
+                "data: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"msg_pong_123\",\"type\":\"message\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"pong\"}],\"role\":\"assistant\"},\"output_index\":0}\n\n",
+                "event: response.completed\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_pong_123\",\"model\":\"gpt-5.1-codex\",\"output\":[],\"usage\":{\"input_tokens\":20,\"output_tokens\":5,\"total_tokens\":25}}}\n\n"
+            );
+
+            ([(http::header::CONTENT_TYPE, "text/event-stream")], payload).into_response()
         }
 
         let app = Router::new()
@@ -3033,6 +3113,22 @@ mod tests {
         assert_eq!(response.model, "gpt-5.1-codex");
         assert_eq!(response.output_text, "hello from codex");
         assert_eq!(response.usage.total_tokens, 8);
+    }
+
+    #[tokio::test]
+    async fn responses_on_codex_endpoint_falls_back_to_streamed_text_when_completed_output_is_empty()
+     {
+        let addr = spawn_codex_empty_completed_output_server().await;
+        let (provider, mut request, _) =
+            setup_provider(&format!("http://{addr}/backend-api/codex")).await;
+        request.public_model = "gpt-5-codex".to_string();
+        request.upstream_model = Some("gpt-5-codex".to_string());
+
+        let response = provider.responses(request).await.expect("responses");
+
+        assert_eq!(response.model, "gpt-5.1-codex");
+        assert_eq!(response.output_text, "pong");
+        assert_eq!(response.usage.total_tokens, 25);
     }
 
     #[tokio::test]
