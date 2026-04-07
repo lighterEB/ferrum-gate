@@ -4,16 +4,6 @@ server {
 
     client_max_body_size 10m;
 
-    set $tenant_management_authorization "";
-    if ($TENANT_MANAGEMENT_TOKEN != "") {
-        set $tenant_management_authorization "Bearer $TENANT_MANAGEMENT_TOKEN";
-    }
-
-    set $control_plane_authorization "";
-    if ($CONTROL_PLANE_TOKEN != "") {
-        set $control_plane_authorization "Bearer $CONTROL_PLANE_TOKEN";
-    }
-
     location = /health {
         proxy_pass http://gateway-http:3005/health;
         proxy_http_version 1.1;
@@ -49,7 +39,7 @@ server {
         proxy_pass http://tenant-api:3006;
         proxy_http_version 1.1;
         proxy_read_timeout 300s;
-        proxy_set_header Authorization $tenant_management_authorization;
+        proxy_set_header Authorization "Bearer ${TENANT_MANAGEMENT_TOKEN}";
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -62,7 +52,7 @@ server {
         proxy_pass http://control-plane:3007;
         proxy_http_version 1.1;
         proxy_read_timeout 300s;
-        proxy_set_header Authorization $control_plane_authorization;
+        proxy_set_header Authorization "Bearer ${CONTROL_PLANE_TOKEN}";
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -75,7 +65,7 @@ server {
         proxy_pass http://control-plane:3007;
         proxy_http_version 1.1;
         proxy_read_timeout 300s;
-        proxy_set_header Authorization $control_plane_authorization;
+        proxy_set_header Authorization "Bearer ${CONTROL_PLANE_TOKEN}";
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
