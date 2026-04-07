@@ -176,8 +176,8 @@ describe("connect page", () => {
 		vi.stubEnv("VITE_DEFAULT_TENANT_API_BASE_URL", "");
 		vi.stubEnv("VITE_DEFAULT_CONTROL_PLANE_BASE_URL", "");
 		vi.stubEnv("VITE_DEFAULT_GATEWAY_BASE_URL", "/v1");
-		vi.stubEnv("VITE_TENANT_MANAGEMENT_TOKEN", "__proxy_auth__");
-		vi.stubEnv("VITE_CONTROL_PLANE_TOKEN", "__proxy_auth__");
+		vi.stubEnv("VITE_TENANT_MANAGEMENT_TOKEN", "");
+		vi.stubEnv("VITE_CONTROL_PLANE_TOKEN", "");
 		vi.stubEnv("VITE_CONSOLE_SECRET_TOKEN", "");
 		vi.stubEnv("VITE_CONSOLE_USERNAME", "");
 		vi.stubEnv("VITE_CONSOLE_PASSWORD", "");

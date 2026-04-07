@@ -89,8 +89,10 @@ export function ConnectPage() {
 		gatewayBaseUrl &&
 			tenantApiBaseUrl === "" &&
 			controlPlaneBaseUrl === "" &&
-			tenantManagementToken === PROXY_AUTH_TOKEN &&
-			controlPlaneToken === PROXY_AUTH_TOKEN,
+			!tenantManagementToken &&
+			!controlPlaneToken &&
+			!hasSecretTokenLogin &&
+			!hasPasswordLogin,
 	);
 	const [loginMode, setLoginMode] = useState<LoginMode>(
 		hasSecretTokenLogin ? "token" : "password",
