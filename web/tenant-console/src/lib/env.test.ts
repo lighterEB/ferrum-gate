@@ -6,6 +6,8 @@ import {
 	getConsolePassword,
 	getConsoleSecretToken,
 	getConsoleUsername,
+	getDefaultControlPlaneBaseUrl,
+	getDefaultGatewayBaseUrl,
 	getDefaultTenantApiBaseUrl,
 	isDevRuntime,
 } from "@/lib/env";
@@ -71,5 +73,11 @@ describe("env helpers", () => {
 				VITE_DEFAULT_TENANT_API_BASE_URL: "http://127.0.0.1:3006 ",
 			}),
 		).toBe("http://127.0.0.1:3006");
+	});
+
+	it("defaults production service urls to same-origin proxy paths", () => {
+		expect(getDefaultTenantApiBaseUrl({ DEV: false })).toBe("");
+		expect(getDefaultControlPlaneBaseUrl({ DEV: false })).toBe("");
+		expect(getDefaultGatewayBaseUrl({ DEV: false })).toBe("/v1");
 	});
 });

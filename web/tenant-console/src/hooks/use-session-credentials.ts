@@ -11,7 +11,7 @@ export type SessionCredentials = {
 export function getSessionCredentials(
 	session: SessionSnapshot,
 ): SessionCredentials | null {
-	if (!session.baseUrl || !session.token) {
+	if (session.baseUrl === null || !session.token) {
 		return null;
 	}
 

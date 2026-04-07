@@ -93,8 +93,9 @@ function readSnapshot(): SessionSnapshot {
 		controlPlaneBaseUrl,
 		controlPlaneToken,
 		gatewayBaseUrl,
-		isConnected: Boolean(baseUrl && token),
-		hasControlPlaneAccess: Boolean(controlPlaneBaseUrl && controlPlaneToken),
+		isConnected: baseUrl !== null && Boolean(token),
+		hasControlPlaneAccess:
+			controlPlaneBaseUrl !== null && Boolean(controlPlaneToken),
 	};
 }
 

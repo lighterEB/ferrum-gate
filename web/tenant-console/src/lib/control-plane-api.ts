@@ -101,6 +101,15 @@ function sanitizeBaseUrl(baseUrl: string) {
 	return baseUrl.trim().replace(/\/+$/, "");
 }
 
+function authorizationHeader(token: string) {
+	const sanitized = token.trim();
+	if (!sanitized || sanitized === "__proxy_auth__") {
+		return null;
+	}
+
+	return `Bearer ${sanitized}`;
+}
+
 async function request<T>({
 	baseUrl,
 	token,
@@ -118,10 +127,11 @@ async function request<T>({
 
 	let response: Response;
 	try {
+		const bearer = authorizationHeader(token);
 		response = await fetch(url, {
 			method,
 			headers: {
-				Authorization: `Bearer ${token}`,
+				...(bearer ? { Authorization: bearer } : {}),
 				...(body ? { "Content-Type": "application/json" } : {}),
 			},
 			body: body ? JSON.stringify(body) : undefined,

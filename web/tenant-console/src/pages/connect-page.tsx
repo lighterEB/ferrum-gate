@@ -1,10 +1,5 @@
 import { useNavigate } from "@tanstack/react-router";
-import {
-	LockKeyholeIcon,
-	ServerIcon,
-	ShieldCheckIcon,
-	UserRoundIcon,
-} from "lucide-react";
+import { ServerIcon, ShieldCheckIcon } from "lucide-react";
 import { useState } from "react";
 import { useForm } from "react-hook-form";
 import { useTranslation } from "react-i18next";
@@ -39,6 +34,7 @@ import {
 	getDefaultControlPlaneBaseUrl,
 	getDefaultGatewayBaseUrl,
 	getDefaultTenantApiBaseUrl,
+	PROXY_AUTH_TOKEN,
 } from "@/lib/env";
 import { getGatewayHealth } from "@/lib/gateway-api";
 import {
@@ -62,6 +58,10 @@ function hostLabel(value: string, fallback: string) {
 	}
 
 	try {
+		if (value.startsWith("/")) {
+			return value;
+		}
+
 		return new URL(value).host;
 	} catch {
 		return fallback;
@@ -85,6 +85,13 @@ export function ConnectPage() {
 	const consolePassword = getConsolePassword();
 	const hasSecretTokenLogin = Boolean(consoleSecretToken);
 	const hasPasswordLogin = Boolean(consoleUsername && consolePassword);
+	const usesServerSideProxyAuth = Boolean(
+		gatewayBaseUrl &&
+			tenantApiBaseUrl === "" &&
+			controlPlaneBaseUrl === "" &&
+			tenantManagementToken === PROXY_AUTH_TOKEN &&
+			controlPlaneToken === PROXY_AUTH_TOKEN,
+	);
 	const [loginMode, setLoginMode] = useState<LoginMode>(
 		hasSecretTokenLogin ? "token" : "password",
 	);
@@ -96,12 +103,13 @@ export function ConnectPage() {
 		},
 	});
 	const environmentReady = Boolean(
-		tenantApiBaseUrl &&
-			controlPlaneBaseUrl &&
-			gatewayBaseUrl &&
-			tenantManagementToken &&
-			controlPlaneToken &&
-			(hasSecretTokenLogin || hasPasswordLogin),
+		gatewayBaseUrl &&
+			((tenantApiBaseUrl &&
+				controlPlaneBaseUrl &&
+				tenantManagementToken &&
+				controlPlaneToken &&
+				(hasSecretTokenLogin || hasPasswordLogin)) ||
+				usesServerSideProxyAuth),
 	);
 
 	return (
@@ -136,30 +144,32 @@ export function ConnectPage() {
 						</div>
 					) : null}
 
-					<div className="grid grid-cols-2 gap-2 rounded-lg border border-border/70 bg-background/60 p-1.5">
-						{hasSecretTokenLogin ? (
-							<Button
-								variant={loginMode === "token" ? "default" : "ghost"}
-								onClick={() => {
-									setLoginMode("token");
-									form.clearErrors();
-								}}
-							>
-								{t("connect.modes.token")}
-							</Button>
-						) : null}
-						{hasPasswordLogin ? (
-							<Button
-								variant={loginMode === "password" ? "default" : "ghost"}
-								onClick={() => {
-									setLoginMode("password");
-									form.clearErrors();
-								}}
-							>
-								{t("connect.modes.password")}
-							</Button>
-						) : null}
-					</div>
+					{hasSecretTokenLogin || hasPasswordLogin ? (
+						<div className="grid grid-cols-2 gap-2 rounded-lg border border-border/70 bg-background/60 p-1.5">
+							{hasSecretTokenLogin ? (
+								<Button
+									variant={loginMode === "token" ? "default" : "ghost"}
+									onClick={() => {
+										setLoginMode("token");
+										form.clearErrors();
+									}}
+								>
+									{t("connect.modes.token")}
+								</Button>
+							) : null}
+							{hasPasswordLogin ? (
+								<Button
+									variant={loginMode === "password" ? "default" : "ghost"}
+									onClick={() => {
+										setLoginMode("password");
+										form.clearErrors();
+									}}
+								>
+									{t("connect.modes.password")}
+								</Button>
+							) : null}
+						</div>
+					) : null}
 
 					<Form {...form}>
 						<form
@@ -172,7 +182,7 @@ export function ConnectPage() {
 									return;
 								}
 
-								if (loginMode === "token") {
+								if (!usesServerSideProxyAuth && loginMode === "token") {
 									const candidate = values.secretToken.trim();
 
 									if (!candidate) {
@@ -186,7 +196,7 @@ export function ConnectPage() {
 										toast.error(t("connect.errors.invalidConsoleCredentials"));
 										return;
 									}
-								} else {
+								} else if (!usesServerSideProxyAuth) {
 									const username = values.username.trim();
 									const password = values.password.trim();
 
@@ -216,19 +226,26 @@ export function ConnectPage() {
 								}
 
 								try {
+									const currentTenantToken = usesServerSideProxyAuth
+										? PROXY_AUTH_TOKEN
+										: tenantManagementToken;
+									const currentControlPlaneToken = usesServerSideProxyAuth
+										? PROXY_AUTH_TOKEN
+										: controlPlaneToken;
+
 									await Promise.all([
-										getTenantMe(tenantApiBaseUrl, tenantManagementToken),
+										getTenantMe(tenantApiBaseUrl, currentTenantToken),
 										listProviderAccounts(
 											controlPlaneBaseUrl,
-											controlPlaneToken,
+											currentControlPlaneToken,
 										),
 									]);
 
 									connectSession({
 										baseUrl: tenantApiBaseUrl,
-										token: tenantManagementToken,
+										token: currentTenantToken,
 										controlPlaneBaseUrl,
-										controlPlaneToken,
+										controlPlaneToken: currentControlPlaneToken,
 										gatewayBaseUrl,
 									});
 
@@ -247,7 +264,7 @@ export function ConnectPage() {
 								}
 							})}
 						>
-							{loginMode === "token" ? (
+							{!usesServerSideProxyAuth && loginMode === "token" ? (
 								<FormField
 									control={form.control}
 									name="secretToken"
@@ -259,6 +276,7 @@ export function ConnectPage() {
 											<FormControl>
 												<Input
 													type="password"
+													autoComplete="one-time-code"
 													placeholder={t(
 														"connect.fields.secretToken.placeholder",
 													)}
@@ -269,8 +287,9 @@ export function ConnectPage() {
 										</FormItem>
 									)}
 								/>
-							) : (
-								<div className="grid gap-5">
+							) : null}
+							{!usesServerSideProxyAuth && loginMode === "password" ? (
+								<>
 									<FormField
 										control={form.control}
 										name="username"
@@ -281,10 +300,10 @@ export function ConnectPage() {
 												</FormLabel>
 												<FormControl>
 													<Input
+														autoComplete="username"
 														placeholder={t(
 															"connect.fields.username.placeholder",
 														)}
-														autoComplete="username"
 														{...field}
 													/>
 												</FormControl>
@@ -303,10 +322,10 @@ export function ConnectPage() {
 												<FormControl>
 													<Input
 														type="password"
+														autoComplete="current-password"
 														placeholder={t(
 															"connect.fields.password.placeholder",
 														)}
-														autoComplete="current-password"
 														{...field}
 													/>
 												</FormControl>
@@ -314,51 +333,48 @@ export function ConnectPage() {
 											</FormItem>
 										)}
 									/>
-								</div>
-							)}
+								</>
+							) : null}
 
-							<div className="grid gap-3 rounded-lg border border-border/70 bg-background/70 p-4 text-sm">
-								<div className="inline-flex items-center gap-2 font-medium text-foreground">
-									<UserRoundIcon className="size-4" />
+							<div className="space-y-3 rounded-lg border border-border/70 bg-background/70 px-4 py-3 text-sm text-muted-foreground">
+								<div className="flex items-center gap-2 font-medium text-foreground">
+									<ServerIcon className="size-4" />
 									<span>{t("connect.environment.title")}</span>
 								</div>
-								<div className="grid gap-2 text-muted-foreground">
+								<div className="grid gap-2">
 									<p>
 										{t("connect.environment.tenant")}:{" "}
-										{hostLabel(
-											tenantApiBaseUrl,
-											t("connect.hero.endpointFallback"),
-										)}
+										<span className="font-mono text-xs text-foreground">
+											{hostLabel(
+												tenantApiBaseUrl,
+												t("connect.hero.endpointFallback"),
+											)}
+										</span>
 									</p>
 									<p>
 										{t("connect.environment.controlPlane")}:{" "}
-										{hostLabel(
-											controlPlaneBaseUrl,
-											t("connect.hero.endpointFallback"),
-										)}
+										<span className="font-mono text-xs text-foreground">
+											{hostLabel(
+												controlPlaneBaseUrl,
+												t("connect.hero.endpointFallback"),
+											)}
+										</span>
 									</p>
 									<p>
 										{t("connect.environment.gateway")}:{" "}
-										{hostLabel(
-											gatewayBaseUrl,
-											t("connect.hero.endpointFallback"),
-										)}
+										<span className="font-mono text-xs text-foreground">
+											{hostLabel(
+												gatewayBaseUrl,
+												t("connect.hero.endpointFallback"),
+											)}
+										</span>
 									</p>
 								</div>
 							</div>
 
-							<div className="flex items-center justify-between gap-4">
-								<div className="inline-flex items-center gap-2 text-sm text-muted-foreground">
-									<ServerIcon className="size-4" />
-									<span>{t("connect.login.helper")}</span>
-								</div>
-								<Button type="submit" disabled={form.formState.isSubmitting}>
-									<LockKeyholeIcon className="size-4" />
-									{form.formState.isSubmitting
-										? t("common.connecting")
-										: t("common.connect")}
-								</Button>
-							</div>
+							<Button type="submit" className="w-full">
+								{t("common.connect")}
+							</Button>
 						</form>
 					</Form>
 				</CardContent>

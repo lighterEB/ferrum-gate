@@ -76,7 +76,9 @@ services:
       - "${CONTROL_PLANE_PORT:-3007}:3007"
 
   nginx:
-    image: nginx:1.27-alpine
+    build:
+      context: .
+      dockerfile: docker/nginx.Dockerfile
     restart: unless-stopped
     depends_on:
       - gateway-http
@@ -84,8 +86,11 @@ services:
       - control-plane
     ports:
       - "${NGINX_PORT:-80}:80"
-    volumes:
-      - ./docker/nginx/backend.conf:/etc/nginx/conf.d/default.conf:ro
+    environment:
+      TENANT_MANAGEMENT_TOKEN: ${FERRUMGATE_NGINX_TENANT_MANAGEMENT_TOKEN:-}
+      CONTROL_PLANE_TOKEN: ${FERRUMGATE_NGINX_CONTROL_PLANE_TOKEN:-}
+      CONSOLE_BASIC_AUTH_USERNAME: ${FERRUMGATE_CONSOLE_BASIC_AUTH_USERNAME:-}
+      CONSOLE_BASIC_AUTH_PASSWORD: ${FERRUMGATE_CONSOLE_BASIC_AUTH_PASSWORD:-}
 
 volumes:
   postgres_data:

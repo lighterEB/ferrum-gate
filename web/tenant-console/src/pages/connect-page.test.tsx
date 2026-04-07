@@ -50,15 +50,16 @@ describe("connect page", () => {
 		);
 
 		const { router } = renderApp("/connect");
+		const connectButton = await screen.findByRole("button", {
+			name: i18n.t("common.connect"),
+		});
 		await screen.findByLabelText(i18n.t("connect.fields.secretToken.label"));
 
 		await user.type(
 			screen.getByLabelText(i18n.t("connect.fields.secretToken.label")),
 			"console_secret",
 		);
-		await user.click(
-			screen.getByRole("button", { name: i18n.t("common.connect") }),
-		);
+		await user.click(connectButton);
 
 		await waitFor(() => {
 			expect(router.state.location.pathname).toBe("/dashboard");
@@ -84,15 +85,16 @@ describe("connect page", () => {
 		vi.stubEnv("VITE_CONSOLE_SECRET_TOKEN", "console_secret");
 
 		const { router } = renderApp("/connect");
+		const connectButton = await screen.findByRole("button", {
+			name: i18n.t("common.connect"),
+		});
 		await screen.findByLabelText(i18n.t("connect.fields.secretToken.label"));
 
 		await user.type(
 			screen.getByLabelText(i18n.t("connect.fields.secretToken.label")),
 			"bad-token",
 		);
-		await user.click(
-			screen.getByRole("button", { name: i18n.t("common.connect") }),
-		);
+		await user.click(connectButton);
 
 		expect(
 			await screen.findByText(
@@ -166,5 +168,67 @@ describe("connect page", () => {
 		await waitFor(() => {
 			expect(router.state.location.pathname).toBe("/dashboard");
 		});
+	});
+
+	it("connects through same-origin proxy auth without browser-visible secrets", async () => {
+		const user = userEvent.setup();
+		vi.stubEnv("DEV", false);
+		vi.stubEnv("VITE_DEFAULT_TENANT_API_BASE_URL", "");
+		vi.stubEnv("VITE_DEFAULT_CONTROL_PLANE_BASE_URL", "");
+		vi.stubEnv("VITE_DEFAULT_GATEWAY_BASE_URL", "/v1");
+		vi.stubEnv("VITE_TENANT_MANAGEMENT_TOKEN", "");
+		vi.stubEnv("VITE_CONTROL_PLANE_TOKEN", "");
+		vi.stubEnv("VITE_CONSOLE_SECRET_TOKEN", "");
+		vi.stubEnv("VITE_CONSOLE_USERNAME", "");
+		vi.stubEnv("VITE_CONSOLE_PASSWORD", "");
+
+		server.use(
+			http.get("/tenant/v1/me", ({ request }) => {
+				expect(request.headers.get("authorization")).toBeNull();
+
+				return HttpResponse.json({
+					id: "tenant_1",
+					slug: "demo",
+					name: "Demo Tenant",
+					suspended: false,
+					created_at: "2026-04-05T00:00:00Z",
+				});
+			}),
+			http.get("/internal/v1/runtime/provider-accounts", ({ request }) => {
+				expect(request.headers.get("authorization")).toBeNull();
+				return HttpResponse.json({ data: [] });
+			}),
+			http.get("/internal/v1/alerts/outbox", () =>
+				HttpResponse.json({ data: [] }),
+			),
+			http.get("/internal/v1/audit/events", () =>
+				HttpResponse.json({ data: [] }),
+			),
+			http.get("/tenant/v1/api-keys", () => HttpResponse.json({ data: [] })),
+			http.get("/tenant/v1/models", () => HttpResponse.json({ data: [] })),
+			http.get("/health", () => HttpResponse.json({ status: "ok" })),
+		);
+
+		const { router } = renderApp("/connect");
+		const connectButton = await screen.findByRole("button", {
+			name: i18n.t("common.connect"),
+		});
+
+		expect(
+			screen.queryByLabelText(i18n.t("connect.fields.secretToken.label")),
+		).not.toBeInTheDocument();
+		expect(
+			screen.queryByLabelText(i18n.t("connect.fields.username.label")),
+		).not.toBeInTheDocument();
+
+		await user.click(connectButton);
+
+		await waitFor(() => {
+			expect(router.state.location.pathname).toBe("/dashboard");
+		});
+
+		expect(getSessionSnapshot().baseUrl).toBe("");
+		expect(getSessionSnapshot().controlPlaneBaseUrl).toBeNull();
+		expect(getSessionSnapshot().gatewayBaseUrl).toBe("/v1");
 	});
 });

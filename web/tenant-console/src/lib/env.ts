@@ -12,6 +12,8 @@ type RuntimeEnv = {
 	VITE_DEV_CONTROL_PLANE_TOKEN?: string;
 };
 
+export const PROXY_AUTH_TOKEN = "__proxy_auth__";
+
 function isLoopbackHost(hostname: string) {
 	return (
 		hostname === "127.0.0.1" || hostname === "localhost" || hostname === "::1"
@@ -46,6 +48,10 @@ export function isDevRuntime(env: RuntimeEnv = import.meta.env) {
 }
 
 export function getDefaultTenantApiBaseUrl(env: RuntimeEnv = import.meta.env) {
+	if (!isDevRuntime(env) && !env.VITE_DEFAULT_TENANT_API_BASE_URL?.trim()) {
+		return "";
+	}
+
 	return adaptUrlToBrowserHost(
 		env.VITE_DEFAULT_TENANT_API_BASE_URL?.trim() ?? "",
 	);
@@ -76,6 +82,10 @@ export function getDefaultControlPlaneBaseUrl(
 		return adaptUrlToBrowserHost(configured);
 	}
 
+	if (!isDevRuntime(env)) {
+		return "";
+	}
+
 	return adaptUrlToBrowserHost(
 		deriveSiblingServiceUrl(getDefaultTenantApiBaseUrl(env), "3007"),
 	);
@@ -85,6 +95,10 @@ export function getDefaultGatewayBaseUrl(env: RuntimeEnv = import.meta.env) {
 	const configured = env.VITE_DEFAULT_GATEWAY_BASE_URL?.trim();
 	if (configured) {
 		return adaptUrlToBrowserHost(configured);
+	}
+
+	if (!isDevRuntime(env)) {
+		return "/v1";
 	}
 
 	return adaptUrlToBrowserHost(

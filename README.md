@@ -84,9 +84,9 @@ Default addresses:
 - `control-plane`: `127.0.0.1:3007`
 - `tenant-console`: `127.0.0.1:5173`
 
-## Backend-Only Docker Compose
+## Public VPS Docker Compose
 
-For a VPS deployment that only needs the APIs, you can now run Postgres plus the three backend services with Docker Compose, fronted by Nginx.
+The Docker Compose path now supports a public VPS deployment that serves the tenant console SPA from Nginx while keeping management tokens out of the browser bundle.
 
 1. Copy the environment template:
 
@@ -99,6 +99,10 @@ cp .env.example .env
 ```bash
 FERRUMGATE_MASTER_KEY=<strong-random-secret>
 FERRUMGATE_SEED_DEMO_DATA=true
+FERRUMGATE_NGINX_TENANT_MANAGEMENT_TOKEN=<tenant-management-token>
+FERRUMGATE_NGINX_CONTROL_PLANE_TOKEN=<control-plane-token>
+FERRUMGATE_CONSOLE_BASIC_AUTH_USERNAME=<console-username>
+FERRUMGATE_CONSOLE_BASIC_AUTH_PASSWORD=<console-password>
 ```
 
 If you want Compose to use its bundled Postgres service, leave:
@@ -109,34 +113,34 @@ DATABASE_URL=postgres://ferrum_gate:ferrum_gate@postgres:5432/ferrum_gate
 
 If you want to use an external Postgres instead, replace `DATABASE_URL` with that external connection string.
 
-3. Start the backend stack:
+3. Start the public stack:
 
 ```bash
 docker compose up -d --build
 ```
 
-4. Verify the services:
+4. Verify the public edge:
 
 ```bash
 curl http://127.0.0.1/health
+curl -u <console-username>:<console-password> http://127.0.0.1/
+curl -u <console-username>:<console-password> http://127.0.0.1/tenant/v1/me
 curl http://127.0.0.1/v1/models -H "Authorization: Bearer fgk_demo_gateway_key"
-curl http://127.0.0.1/tenant/v1/me -H "Authorization: Bearer fg_tenant_admin_demo"
-curl http://127.0.0.1/internal/v1/provider-accounts -H "Authorization: Bearer fg_cp_admin_demo"
 ```
 
-This backend-only deployment is enough to:
+This deployment serves:
 
-- upload provider accounts through `control-plane`
-- create downstream API keys through `tenant-api`
-- serve OpenAI-compatible chat and responses traffic through `gateway-http`
+- `/` -> tenant console SPA
+- `/tenant/*` -> `tenant-api` with server-injected management auth
+- `/internal/*` and `/external/*` -> `control-plane` with server-injected control-plane auth
+- `/v1/*` -> `gateway-http`
 
-Security note:
+Security notes:
 
-- Nginx listens on `NGINX_PORT` and proxies:
-- `/health` and `/v1/*` -> `gateway-http`
-- `/tenant/*` -> `tenant-api`
-- `/internal/*` and `/external/*` -> `control-plane`
-- `tenant-api` and `control-plane` should still usually be restricted by firewall, reverse proxy auth, or source IP allowlists if they are reachable from untrusted networks
+- Browser clients no longer need `VITE_TENANT_MANAGEMENT_TOKEN`, `VITE_CONTROL_PLANE_TOKEN`, or console secrets for public deploys.
+- The console is protected at the Nginx edge with HTTP basic auth.
+- `FERRUMGATE_NGINX_TENANT_MANAGEMENT_TOKEN` and `FERRUMGATE_NGINX_CONTROL_PLANE_TOKEN` must be stored only on the server.
+- Put TLS in front of the public console before exposing it to the internet.
 
 ## GHCR VPS Deployment
 
@@ -144,7 +148,7 @@ If you do not want to keep the source tree on the VPS, use the published GHCR im
 
 The repository now includes:
 
-- `.github/workflows/publish-images.yml` to build and publish backend images on every push to `main`
+- `.github/workflows/publish-images.yml` to build and publish the backend + nginx/frontend images on every push to `main`
 - `docker-compose.vps.yml` for image-based deployment
 - `vps.env.example` for the VPS runtime environment
 
@@ -206,9 +210,7 @@ Useful variables:
 - `VITE_CONSOLE_PASSWORD=<optional-console-password>`
 - `FERRUMGATE_TENANT_API_ALLOWED_ORIGINS=http://127.0.0.1:5173`
 
-The unified console no longer asks operators to paste raw backend URLs or system tokens on the login page.
-Deployment should fix the tenant API, control plane, and gateway endpoints via environment variables, then expose either a single `VITE_CONSOLE_SECRET_TOKEN` or a `VITE_CONSOLE_USERNAME` / `VITE_CONSOLE_PASSWORD` pair for operator sign-in.
-When `tenant-console` and `tenant-api` are deployed on different origins, set `FERRUMGATE_TENANT_API_ALLOWED_ORIGINS` to the exact console origin.
+For public VPS deployments, do **not** ship the management tokens or console credentials through `VITE_*` variables. The production console now defaults to same-origin paths (`/tenant`, `/internal`, `/v1`) and expects Nginx to provide edge auth plus server-side header injection.
 
 ## Routing Model Derivation
 
