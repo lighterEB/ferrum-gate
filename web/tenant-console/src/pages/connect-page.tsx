@@ -264,7 +264,9 @@ export function ConnectPage() {
 								}
 							})}
 						>
-							{!usesServerSideProxyAuth && loginMode === "token" ? (
+							{!usesServerSideProxyAuth &&
+							hasSecretTokenLogin &&
+							loginMode === "token" ? (
 								<FormField
 									control={form.control}
 									name="secretToken"
@@ -288,7 +290,9 @@ export function ConnectPage() {
 									)}
 								/>
 							) : null}
-							{!usesServerSideProxyAuth && loginMode === "password" ? (
+							{!usesServerSideProxyAuth &&
+							hasPasswordLogin &&
+							loginMode === "password" ? (
 								<>
 									<FormField
 										control={form.control}

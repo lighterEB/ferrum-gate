@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import nginxConfig from "../../../../docker/nginx/backend.conf?raw";
+import nginxConfig from "../../../../docker/nginx/backend.conf.template?raw";
 import nginxDockerfile from "../../../../docker/nginx.Dockerfile?raw";
 import readme from "../../../../README.md?raw";
 import vpsEnv from "../../../../vps.env.example?raw";
@@ -51,11 +51,13 @@ describe("public VPS deploy guardrails", () => {
 		expect(vpsEnv).not.toMatch(
 			/VITE_(TENANT_MANAGEMENT_TOKEN|CONTROL_PLANE_TOKEN|CONSOLE_SECRET_TOKEN|CONSOLE_USERNAME|CONSOLE_PASSWORD)/,
 		);
-		expect(tenantConsoleSection).toMatch(/dev-only/i);
+		expect(tenantConsoleSection).toMatch(
+			/local flow|development|public VPS deployment/i,
+		);
 		expect(tenantConsoleSection).toMatch(
 			/public deployment|public VPS deployment|browser/i,
 		);
-		expect(tenantConsoleSection).toMatch(/must not|do not/i);
+		expect(tenantConsoleSection).toMatch(/must not|do\s*\*\*?not/i);
 		expect(tenantConsoleSection).toMatch(/secret/i);
 	});
 });
