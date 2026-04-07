@@ -2,7 +2,6 @@ import { Link, useRouterState } from "@tanstack/react-router";
 import {
 	BellRingIcon,
 	BlocksIcon,
-	BookOpenIcon,
 	HouseIcon,
 	KeyRoundIcon,
 	ShieldEllipsisIcon,
@@ -27,7 +26,6 @@ const NAV_ICONS = {
 	"/routing": BlocksIcon,
 	"/alerts": BellRingIcon,
 	"/audit": ShieldEllipsisIcon,
-	"/docs": BookOpenIcon,
 } as const;
 
 function endpointHost(url: string | null) {

@@ -7,7 +7,6 @@ export const consoleNavItems = [
 	{ to: "/routing", key: "app.navigation.routing" },
 	{ to: "/alerts", key: "app.navigation.alerts" },
 	{ to: "/audit", key: "app.navigation.audit" },
-	{ to: "/docs", key: "app.navigation.docs" },
 ] as const;
 
 export function getRouteTitle(pathname: string, t: TFunction) {

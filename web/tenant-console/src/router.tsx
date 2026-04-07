@@ -15,7 +15,6 @@ import { ApiKeysPage } from "@/pages/api-keys-page";
 import { AuditPage } from "@/pages/audit-page";
 import { ConnectPage } from "@/pages/connect-page";
 import { DashboardPage } from "@/pages/dashboard-page";
-import { DocsPage } from "@/pages/docs-page";
 import { RoutingPage } from "@/pages/routing-page";
 import { isConnected } from "@/session/store";
 
@@ -98,13 +97,6 @@ const auditRoute = createRoute({
 	component: AuditPage,
 });
 
-const docsRoute = createRoute({
-	getParentRoute: () => rootRoute,
-	path: "/docs",
-	beforeLoad: requireConnected,
-	component: DocsPage,
-});
-
 const routeTree = rootRoute.addChildren([
 	indexRoute,
 	connectRoute,
@@ -114,7 +106,6 @@ const routeTree = rootRoute.addChildren([
 	routingRoute,
 	alertsRoute,
 	auditRoute,
-	docsRoute,
 ]);
 
 export function createAppRouter(history?: RouterHistory) {

@@ -189,15 +189,6 @@ export function DashboardPage() {
 						>
 							{t("dashboard.quickActions.apiKeys")}
 						</Link>
-						<Link
-							to="/docs"
-							className={cn(
-								buttonVariants({ variant: "outline" }),
-								"justify-start",
-							)}
-						>
-							{t("dashboard.quickActions.docs")}
-						</Link>
 					</CardContent>
 				</Card>
 			</div>
