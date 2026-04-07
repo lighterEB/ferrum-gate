@@ -231,7 +231,7 @@ describe("connect page", () => {
 		});
 
 		expect(getSessionSnapshot().baseUrl).toBe("");
-		expect(getSessionSnapshot().controlPlaneBaseUrl).toBeNull();
+		expect(getSessionSnapshot().controlPlaneBaseUrl).toBe("");
 		expect(getSessionSnapshot().gatewayBaseUrl).toBe("/v1");
 	});
 });

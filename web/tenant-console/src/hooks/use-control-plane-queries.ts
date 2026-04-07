@@ -13,12 +13,16 @@ import {
 } from "@/lib/control-plane-api";
 
 function requireControlPlane(credentials: SessionCredentials | null) {
-	if (!credentials?.controlPlaneBaseUrl || !credentials.controlPlaneToken) {
+	if (
+		!credentials ||
+		credentials.controlPlaneBaseUrl === null ||
+		!credentials.controlPlaneToken
+	) {
 		throw new Error("Control plane is not connected");
 	}
 
 	return {
-		baseUrl: credentials.controlPlaneBaseUrl,
+		baseUrl: credentials.controlPlaneBaseUrl ?? "",
 		token: credentials.controlPlaneToken,
 	};
 }
@@ -36,7 +40,9 @@ export function useProviderAccounts(credentials: SessionCredentials | null) {
 	return useQuery({
 		queryKey: providerAccountsKey(credentials?.controlPlaneBaseUrl),
 		enabled: Boolean(
-			credentials?.controlPlaneBaseUrl && credentials.controlPlaneToken,
+			credentials &&
+				credentials.controlPlaneBaseUrl !== null &&
+				credentials.controlPlaneToken,
 		),
 		queryFn: async () => {
 			const resolved = requireControlPlane(credentials);
@@ -111,7 +117,9 @@ export function useAlerts(credentials: SessionCredentials | null) {
 	return useQuery({
 		queryKey: alertsKey(credentials?.controlPlaneBaseUrl),
 		enabled: Boolean(
-			credentials?.controlPlaneBaseUrl && credentials.controlPlaneToken,
+			credentials &&
+				credentials.controlPlaneBaseUrl !== null &&
+				credentials.controlPlaneToken,
 		),
 		queryFn: async () => {
 			const resolved = requireControlPlane(credentials);
@@ -124,7 +132,9 @@ export function useAuditEvents(credentials: SessionCredentials | null) {
 	return useQuery({
 		queryKey: auditEventsKey(credentials?.controlPlaneBaseUrl),
 		enabled: Boolean(
-			credentials?.controlPlaneBaseUrl && credentials.controlPlaneToken,
+			credentials &&
+				credentials.controlPlaneBaseUrl !== null &&
+				credentials.controlPlaneToken,
 		),
 		queryFn: async () => {
 			const resolved = requireControlPlane(credentials);
@@ -137,7 +147,9 @@ export function useRoutingOverview(credentials: SessionCredentials | null) {
 	return useQuery({
 		queryKey: routingOverviewKey(credentials?.controlPlaneBaseUrl),
 		enabled: Boolean(
-			credentials?.controlPlaneBaseUrl && credentials.controlPlaneToken,
+			credentials &&
+				credentials.controlPlaneBaseUrl !== null &&
+				credentials.controlPlaneToken,
 		),
 		queryFn: async () => {
 			const resolved = requireControlPlane(credentials);

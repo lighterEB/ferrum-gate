@@ -143,6 +143,11 @@ export function connectSession({
 			SESSION_STORAGE_KEYS.controlPlaneBaseUrl,
 			sanitizedControlPlaneBaseUrl,
 		);
+	} else if (sanitizedControlPlaneToken) {
+		writeStorage(
+			SESSION_STORAGE_KEYS.controlPlaneBaseUrl,
+			sanitizedControlPlaneBaseUrl,
+		);
 	} else {
 		removeStorage(SESSION_STORAGE_KEYS.controlPlaneBaseUrl);
 	}
