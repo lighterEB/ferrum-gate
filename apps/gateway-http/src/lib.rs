@@ -146,7 +146,7 @@ mod tests {
         Router,
         body::{Body, to_bytes},
         extract::Request as AxumRequest,
-        http::Request,
+        http::{Request, StatusCode},
         response::IntoResponse,
         routing::{get, post},
     };
