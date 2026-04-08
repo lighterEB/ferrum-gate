@@ -2,9 +2,9 @@ use crate::{
     AccountInspectionRecord, AccountInspectionStatus, AlertDeliveryReceipt, AuditEvent, AuthError,
     CreatedApiKey, GatewayAuthContext, Permission, ProbeDispatchLease, ProviderAccountCandidate,
     ProviderAccountQuotaSnapshotRecord, ProviderAccountRecord, RefreshDispatchLease, RequestRecord,
-    Role, RouteGroupBindingRecord, RouteGroupRecord, ScopeTarget, ServiceAccountPrincipal,
-    StoreError, Tenant, TenantApiKeyStatus, TenantApiKeyView, TenantManagementPrincipal,
-    UsageSummary, default_model_capabilities, derive_route_group_slug,
+    Role, RouteGroupBindingRecord, RouteGroupFallbackRecord, RouteGroupRecord, ScopeTarget,
+    ServiceAccountPrincipal, StoreError, Tenant, TenantApiKeyStatus, TenantApiKeyView,
+    TenantManagementPrincipal, UsageSummary, default_model_capabilities, derive_route_group_slug,
     provider_connection_from_parts, role_allows, scope_allows,
 };
 use aes_gcm::{
@@ -1182,6 +1182,49 @@ impl PostgresPlatformStore {
             .collect()
     }
 
+    pub async fn add_route_group_fallback(
+        &self,
+        route_group_id: Uuid,
+        fallback_route_group_id: Uuid,
+        position: u32,
+    ) -> Result<RouteGroupFallbackRecord, StoreError> {
+        let row = sqlx::query(
+            "insert into route_group_fallbacks
+             (route_group_id, fallback_route_group_id, position, created_at)
+             values ($1, $2, $3, $4)
+             on conflict (route_group_id, fallback_route_group_id) do update
+             set position = excluded.position
+             returning route_group_id, fallback_route_group_id, position, created_at",
+        )
+        .bind(route_group_id)
+        .bind(fallback_route_group_id)
+        .bind(position as i32)
+        .bind(Utc::now())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(store_backend_error)?;
+        route_group_fallback_from_row(&row)
+    }
+
+    pub async fn list_route_group_fallbacks(
+        &self,
+        route_group_id: Uuid,
+    ) -> Result<Vec<RouteGroupFallbackRecord>, StoreError> {
+        let rows = sqlx::query(
+            "select route_group_id, fallback_route_group_id, position, created_at
+             from route_group_fallbacks
+             where route_group_id = $1
+             order by position, fallback_route_group_id",
+        )
+        .bind(route_group_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(store_backend_error)?;
+        rows.into_iter()
+            .map(|row| route_group_fallback_from_row(&row))
+            .collect()
+    }
+
     pub async fn bind_provider_account(
         &self,
         route_group_id: Uuid,
@@ -1722,6 +1765,19 @@ fn route_group_binding_from_row(row: &PgRow) -> Result<RouteGroupBindingRecord, 
             .map_err(store_backend_error)? as u32,
         max_in_flight: row
             .try_get::<i32, _>("max_in_flight")
+            .map_err(store_backend_error)? as u32,
+        created_at: row.try_get("created_at").map_err(store_backend_error)?,
+    })
+}
+
+fn route_group_fallback_from_row(row: &PgRow) -> Result<RouteGroupFallbackRecord, StoreError> {
+    Ok(RouteGroupFallbackRecord {
+        route_group_id: row.try_get("route_group_id").map_err(store_backend_error)?,
+        fallback_route_group_id: row
+            .try_get("fallback_route_group_id")
+            .map_err(store_backend_error)?,
+        position: row
+            .try_get::<i32, _>("position")
             .map_err(store_backend_error)? as u32,
         created_at: row.try_get("created_at").map_err(store_backend_error)?,
     })

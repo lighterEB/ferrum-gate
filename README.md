@@ -239,6 +239,15 @@ For public VPS deployments, do **not** ship the management tokens or console cre
 - Every discovered model automatically ensures a matching `route_group` and `route_group_binding`.
 - `/v1/models` and the tenant console dashboard now derive visible models from active provider-account capabilities instead of depending on manually seeded route groups.
 - Manual route-group and binding APIs still exist for advanced overrides, but the default path is automatic derivation.
+- Aggregated routing now supports **ordered fallback routes** for a primary public model route.
+- Fallback is intentionally conservative:
+  - enabled for rate limits, upstream failures, transport failures, and quota exhaustion
+  - disabled for invalid credentials by default
+- Anthropic parity currently includes:
+  - non-streaming `chat`
+  - non-streaming `responses`
+  - streaming `chat`
+  - streaming `responses` remains a later follow-up
 
 ## Example Requests
 

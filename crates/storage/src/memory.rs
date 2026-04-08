@@ -2,9 +2,9 @@ use crate::{
     AccountInspectionRecord, AccountInspectionStatus, AlertDeliveryReceipt, AuditEvent, AuthError,
     CreatedApiKey, GatewayAuthContext, Permission, ProbeDispatchLease,
     ProviderAccountQuotaSnapshotRecord, ProviderAccountRecord, RefreshDispatchLease, RequestRecord,
-    Role, RouteGroupBindingRecord, RouteGroupRecord, ScopeTarget, ServiceAccountPrincipal,
-    StoreError, Tenant, TenantApiKeyStatus, TenantApiKeyView, TenantManagementPrincipal,
-    UsageSummary, default_model_capabilities, derive_route_group_slug,
+    Role, RouteGroupBindingRecord, RouteGroupFallbackRecord, RouteGroupRecord, ScopeTarget,
+    ServiceAccountPrincipal, StoreError, Tenant, TenantApiKeyStatus, TenantApiKeyView,
+    TenantManagementPrincipal, UsageSummary, default_model_capabilities, derive_route_group_slug,
     provider_connection_from_parts, role_allows, scope_allows,
 };
 use chrono::{TimeDelta, Utc};
@@ -45,6 +45,7 @@ struct InnerStore {
     provider_credentials: RwLock<HashMap<Uuid, Value>>,
     route_groups: RwLock<BTreeMap<Uuid, RouteGroupRecord>>,
     route_group_bindings: RwLock<BTreeMap<Uuid, RouteGroupBindingRecord>>,
+    route_group_fallbacks: RwLock<Vec<RouteGroupFallbackRecord>>,
     runtimes: RwLock<HashMap<Uuid, AccountRuntime>>,
     requests: RwLock<Vec<RequestRecord>>,
     audits: RwLock<Vec<AuditEvent>>,
@@ -125,6 +126,7 @@ impl InMemoryPlatformStore {
             provider_credentials: RwLock::new(HashMap::new()),
             route_groups: RwLock::new(BTreeMap::new()),
             route_group_bindings: RwLock::new(BTreeMap::new()),
+            route_group_fallbacks: RwLock::new(Vec::new()),
             runtimes: RwLock::new(HashMap::new()),
             requests: RwLock::new(Vec::new()),
             audits: RwLock::new(Vec::new()),
@@ -250,6 +252,7 @@ impl InMemoryPlatformStore {
             )])),
             route_groups: RwLock::new(route_groups),
             route_group_bindings: RwLock::new(route_group_bindings),
+            route_group_fallbacks: RwLock::new(Vec::new()),
             runtimes: RwLock::new(runtimes),
             requests: RwLock::new(Vec::new()),
             audits: RwLock::new(Vec::new()),
@@ -1037,6 +1040,52 @@ impl InMemoryPlatformStore {
         Ok(bindings)
     }
 
+    pub async fn add_route_group_fallback(
+        &self,
+        route_group_id: Uuid,
+        fallback_route_group_id: Uuid,
+        position: u32,
+    ) -> Result<RouteGroupFallbackRecord, StoreError> {
+        let record = RouteGroupFallbackRecord {
+            route_group_id,
+            fallback_route_group_id,
+            position,
+            created_at: Utc::now(),
+        };
+        let mut fallbacks = self.inner.route_group_fallbacks.write().await;
+        if let Some(existing) = fallbacks.iter_mut().find(|existing| {
+            existing.route_group_id == route_group_id
+                && existing.fallback_route_group_id == fallback_route_group_id
+        }) {
+            existing.position = position;
+            return Ok(existing.clone());
+        }
+        fallbacks.push(record.clone());
+        Ok(record)
+    }
+
+    pub async fn list_route_group_fallbacks(
+        &self,
+        route_group_id: Uuid,
+    ) -> Result<Vec<RouteGroupFallbackRecord>, StoreError> {
+        let mut fallbacks = self
+            .inner
+            .route_group_fallbacks
+            .read()
+            .await
+            .iter()
+            .filter(|record| record.route_group_id == route_group_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        fallbacks.sort_by(|left, right| {
+            left.position.cmp(&right.position).then(
+                left.fallback_route_group_id
+                    .cmp(&right.fallback_route_group_id),
+            )
+        });
+        Ok(fallbacks)
+    }
+
     pub async fn bind_provider_account(
         &self,
         route_group_id: Uuid,
@@ -1107,16 +1156,25 @@ impl InMemoryPlatformStore {
         &self,
         public_model: &str,
     ) -> Result<Vec<ProviderAccountCandidate>, StoreError> {
-        let Some(route_group) = self.resolve_route_group(public_model).await? else {
+        let route_group_ids = self
+            .inner
+            .route_groups
+            .read()
+            .await
+            .values()
+            .filter(|route_group| route_group.public_model == public_model)
+            .map(|route_group| route_group.id)
+            .collect::<Vec<_>>();
+        if route_group_ids.is_empty() {
             return Ok(Vec::new());
-        };
+        }
         let bindings = self.inner.route_group_bindings.read().await;
         let runtimes = self.inner.runtimes.read().await;
         let accounts = self.inner.provider_accounts.read().await;
 
         Ok(bindings
             .values()
-            .filter(|binding| binding.route_group_id == route_group.id)
+            .filter(|binding| route_group_ids.contains(&binding.route_group_id))
             .filter_map(|binding| {
                 let runtime = runtimes.get(&binding.provider_account_id)?.clone();
                 let account = accounts.get(&binding.provider_account_id)?;

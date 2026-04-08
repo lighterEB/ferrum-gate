@@ -6,6 +6,7 @@ members = [
   "crates/observability",
   "crates/protocol-core",
   "crates/provider-core",
+  "crates/provider-anthropic",
   "crates/provider-openai-codex",
   "crates/scheduler",
   "crates/storage",

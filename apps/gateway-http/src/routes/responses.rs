@@ -10,11 +10,14 @@ use axum::{
 };
 use futures::StreamExt;
 use protocol_core::{FrontendProtocol, InferenceRequest, StreamEventKind};
-use scheduler::ProviderOutcome;
 use std::{collections::BTreeMap, convert::Infallible};
 
 use crate::{
     GatewayAppState,
+    core::{
+        execution_engine::ExecutionEngine,
+        types::{ExecutionError, ExecutionOutput},
+    },
     middleware::{auth::authenticate_gateway, request_id::new_openai_object_id},
     openai_http::{
         ResponsesRequest, internal_error, openai_error, provider_error_response,
@@ -28,7 +31,6 @@ use crate::{
         responses_stream_output_item_added_json, responses_stream_output_item_done_json,
         responses_tools_to_canonical_tools,
     },
-    provider_outcome_for_error,
 };
 
 pub(crate) async fn responses(
@@ -41,57 +43,30 @@ pub(crate) async fn responses(
         Err(response) => return response,
     };
 
-    let candidate = match state.store.choose_candidate(&request.model).await {
-        Ok(Some(candidate)) => candidate,
-        Ok(None) => {
-            return openai_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "No healthy provider candidate",
-            );
-        }
-        Err(error) => return internal_error(&error.to_string()),
-    };
-
-    let route_group = match state.store.resolve_route_group(&request.model).await {
-        Ok(Some(route_group)) => route_group,
-        Ok(None) => return openai_error(StatusCode::NOT_FOUND, "Unknown model"),
-        Err(error) => return internal_error(&error.to_string()),
-    };
-
-    let candidate_account_id = candidate.account_id;
-    let provider_kind = candidate.provider_kind.clone();
-    let route_group_id = route_group.id;
-
-    let Some(provider) = state.registry.get(&provider_kind) else {
-        return openai_error(StatusCode::BAD_GATEWAY, "Provider adapter not registered");
-    };
-
     let canonical = InferenceRequest {
         protocol: FrontendProtocol::OpenAi,
         public_model: request.model.clone(),
-        upstream_model: Some(route_group.upstream_model),
+        upstream_model: None,
         previous_response_id: request.previous_response_id.clone(),
         reasoning: request.reasoning.clone(),
         stream: request.stream,
         messages: responses_input_to_messages(request.input),
         tools: responses_tools_to_canonical_tools(&request.tools),
-        metadata: BTreeMap::from([
-            (
-                "provider_account_id".to_string(),
-                candidate_account_id.to_string(),
-            ),
-            ("route_group_id".to_string(), route_group_id.to_string()),
-        ]),
+        metadata: BTreeMap::new(),
     };
 
-    if request.stream {
-        match provider.stream_responses(canonical).await {
-            Ok(mut provider_stream) => {
-                let store = state.store.clone();
-                let tenant_id = auth.tenant.id;
-                let api_key_id = auth.api_key_id;
+    match ExecutionEngine::execute(
+        &state,
+        &auth,
+        canonical,
+        crate::core::types::RequestedCapability::Responses,
+    )
+    .await
+    {
+        Ok(result) => match result.output {
+            ExecutionOutput::Response(response) => Json(responses_json(response)).into_response(),
+            ExecutionOutput::Stream(mut provider_stream) => {
                 let stream_public_model = request.model.clone();
-                let stream_provider_kind = provider_kind.clone();
                 let stream_response_id = new_openai_object_id("resp");
                 let stream_message_item_id = new_openai_object_id("msg");
                 let stream = stream! {
@@ -143,25 +118,6 @@ pub(crate) async fn responses(
                                 }
                                 StreamEventKind::Done => {
                                     if let Some(response) = event.response {
-                                        store
-                                            .record_request(
-                                                tenant_id,
-                                                Some(api_key_id),
-                                                stream_public_model.clone(),
-                                                stream_provider_kind.clone(),
-                                                200,
-                                                10,
-                                                response.usage.clone(),
-                                            )
-                                            .await
-                                            .ok();
-                                        store
-                                            .mark_scheduler_outcome(
-                                                candidate_account_id,
-                                                ProviderOutcome::Success,
-                                            )
-                                            .await
-                                            .ok();
                                         let final_text = if response.output_text.is_empty() {
                                             streamed_text.clone()
                                         } else {
@@ -236,13 +192,6 @@ pub(crate) async fn responses(
                                 _ => {}
                             },
                             Err(error) => {
-                                store
-                                    .mark_scheduler_outcome(
-                                        candidate_account_id,
-                                        provider_outcome_for_error(&error),
-                                    )
-                                    .await
-                                    .ok();
                                 let payload = responses_stream_failed_json(&stream_response_id, &error);
                                 yield Ok(Event::default().event("response.failed").data(payload.to_string()));
                             }
@@ -250,51 +199,18 @@ pub(crate) async fn responses(
                     }
                 };
 
-                return Sse::new(stream).into_response();
+                Sse::new(stream).into_response()
             }
-            Err(error) => {
-                state
-                    .store
-                    .mark_scheduler_outcome(
-                        candidate_account_id,
-                        provider_outcome_for_error(&error),
-                    )
-                    .await
-                    .ok();
-                return provider_error_response(error);
-            }
+        },
+        Err(ExecutionError::UnknownModel) => openai_error(StatusCode::NOT_FOUND, "Unknown model"),
+        Err(ExecutionError::NoHealthyCandidate) => openai_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "No healthy provider candidate",
+        ),
+        Err(ExecutionError::ProviderNotRegistered(_)) => {
+            openai_error(StatusCode::BAD_GATEWAY, "Provider adapter not registered")
         }
-    }
-
-    match provider.responses(canonical).await {
-        Ok(response) => {
-            state
-                .store
-                .mark_scheduler_outcome(candidate_account_id, ProviderOutcome::Success)
-                .await
-                .ok();
-            state
-                .store
-                .record_request(
-                    auth.tenant.id,
-                    Some(auth.api_key_id),
-                    request.model.clone(),
-                    provider_kind,
-                    200,
-                    8,
-                    response.usage.clone(),
-                )
-                .await
-                .ok();
-            Json(responses_json(response)).into_response()
-        }
-        Err(error) => {
-            state
-                .store
-                .mark_scheduler_outcome(candidate_account_id, provider_outcome_for_error(&error))
-                .await
-                .ok();
-            provider_error_response(error)
-        }
+        Err(ExecutionError::Internal(message)) => internal_error(&message),
+        Err(ExecutionError::Provider(error)) => provider_error_response(error),
     }
 }

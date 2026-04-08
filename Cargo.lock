@@ -818,6 +818,7 @@ dependencies = [
  "http",
  "observability",
  "protocol-core",
+ "provider-anthropic",
  "provider-core",
  "provider-openai-codex",
  "scheduler",
@@ -1836,6 +1837,25 @@ dependencies = [
  "chrono",
  "serde",
  "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "provider-anthropic"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "axum",
+ "chrono",
+ "futures",
+ "http",
+ "protocol-core",
+ "provider-core",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
  "uuid",
 ]
 

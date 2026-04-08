@@ -1,3 +1,4 @@
+mod core;
 mod middleware;
 mod openai_http;
 mod routes;
@@ -11,6 +12,7 @@ use axum::{
     routing::{get, post},
 };
 use protocol_core::ModelCapability;
+use provider_anthropic::AnthropicProvider;
 use provider_core::{ProviderError, ProviderErrorKind, ProviderRegistry};
 use provider_openai_codex::OpenAiCodexProvider;
 use scheduler::ProviderOutcome;
@@ -31,6 +33,7 @@ impl GatewayAppState {
     pub fn demo() -> Self {
         let store = PlatformStore::demo();
         let mut registry = ProviderRegistry::new();
+        registry.register(AnthropicProvider::shared(Arc::new(store.clone())));
         registry.register(OpenAiCodexProvider::shared(Arc::new(store.clone())));
 
         Self { store, registry }
@@ -260,6 +263,188 @@ mod tests {
                 post(codex_chat_handler),
             );
 
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+        addr
+    }
+
+    async fn spawn_rate_limited_codex_endpoint_server() -> SocketAddr {
+        async fn rate_limited_handler() -> impl IntoResponse {
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                axum::Json(json!({
+                    "error": {
+                        "message": "rate limited",
+                        "type": "rate_limit"
+                    }
+                })),
+            )
+        }
+
+        let app = Router::new()
+            .route("/backend-api/codex/responses", post(rate_limited_handler))
+            .fallback(|| async { (StatusCode::NOT_FOUND, Body::empty()) });
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+        addr
+    }
+
+    async fn spawn_anthropic_messages_server() -> SocketAddr {
+        async fn anthropic_messages_handler(request: AxumRequest) -> impl IntoResponse {
+            let api_key = request
+                .headers()
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            let version = request
+                .headers()
+                .get("anthropic-version")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            let body = to_bytes(request.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            let body: Value = serde_json::from_slice(&body).expect("json body");
+
+            assert_eq!(api_key, "gateway-anthropic-key");
+            assert_eq!(version, "2023-06-01");
+            assert_eq!(
+                body.get("model").and_then(Value::as_str),
+                Some("claude-opus-4-5")
+            );
+            assert_eq!(
+                body.pointer("/messages/0/role").and_then(Value::as_str),
+                Some("user")
+            );
+            assert_eq!(
+                body.pointer("/messages/0/content/0/text")
+                    .and_then(Value::as_str),
+                Some("hello")
+            );
+
+            axum::Json(json!({
+                "id": "msg_anthropic_123",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-opus-4-5",
+                "content": [
+                    { "type": "text", "text": "hello from anthropic" }
+                ],
+                "stop_reason": "end_turn",
+                "usage": {
+                    "input_tokens": 5,
+                    "output_tokens": 3
+                }
+            }))
+        }
+
+        let app = Router::new()
+            .route("/v1/messages", post(anthropic_messages_handler))
+            .fallback(|| async { (StatusCode::NOT_FOUND, Body::empty()) });
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+        addr
+    }
+
+    async fn spawn_rate_limited_anthropic_messages_server() -> SocketAddr {
+        async fn messages_handler(request: AxumRequest) -> impl IntoResponse {
+            let api_key = request
+                .headers()
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default();
+            assert_eq!(api_key, "gateway-anthropic-key");
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                axum::Json(json!({ "error": { "message": "rate limited" } })),
+            )
+        }
+
+        let app = Router::new().route("/v1/messages", post(messages_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+        addr
+    }
+
+    async fn spawn_unauthorized_anthropic_messages_server() -> SocketAddr {
+        async fn messages_handler(_request: AxumRequest) -> impl IntoResponse {
+            (
+                StatusCode::UNAUTHORIZED,
+                axum::Json(json!({ "error": { "message": "invalid api key" } })),
+            )
+        }
+
+        let app = Router::new().route("/v1/messages", post(messages_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+        addr
+    }
+
+    async fn spawn_anthropic_streaming_messages_server() -> SocketAddr {
+        async fn messages_handler(request: AxumRequest) -> impl IntoResponse {
+            let api_key = request
+                .headers()
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default();
+            let api_key = api_key.to_string();
+            let body = to_bytes(request.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            let body: Value = serde_json::from_slice(&body).expect("json body");
+
+            assert_eq!(api_key, "gateway-anthropic-key");
+            assert_eq!(
+                body.get("model").and_then(Value::as_str),
+                Some("claude-opus-4-5")
+            );
+
+            let payload = concat!(
+                "event: message_start\n",
+                "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream_123\",\"model\":\"claude-opus-4-5\",\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n",
+                "event: content_block_delta\n",
+                "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hello \"}}\n\n",
+                "event: content_block_delta\n",
+                "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"world\"}}\n\n",
+                "event: message_delta\n",
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n",
+                "event: message_stop\n",
+                "data: {\"type\":\"message_stop\"}\n\n"
+            );
+
+            ([(http::header::CONTENT_TYPE, "text/event-stream")], payload).into_response()
+        }
+
+        let app = Router::new().route("/v1/messages", post(messages_handler));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("listener");
@@ -911,6 +1096,293 @@ mod tests {
         state
     }
 
+    async fn state_with_retryable_codex_route(
+        rate_limited_api_base: &str,
+        healthy_api_base: &str,
+    ) -> GatewayAppState {
+        let state = GatewayAppState::demo();
+        let rate_limited = state
+            .store
+            .ingest_provider_account(
+                ProviderAccountEnvelope {
+                    provider: "openai_codex".to_string(),
+                    credential_kind: "oauth_tokens".to_string(),
+                    payload_version: "v1".to_string(),
+                    credentials: json!({
+                        "access_token": "gateway-codex-rate-limited-token",
+                        "account_id": "acct_gateway_codex_rl",
+                        "api_base": rate_limited_api_base
+                    }),
+                    metadata: json!({ "email": "rate-limited@example.com" }),
+                    labels: vec![],
+                    tags: BTreeMap::new(),
+                },
+                ValidatedProviderAccount {
+                    provider_account_id: "acct_gateway_codex_rl".to_string(),
+                    redacted_display: Some("r***@***".to_string()),
+                    expires_at: None,
+                },
+                AccountCapabilities {
+                    models: vec![ModelDescriptor {
+                        id: "gpt-5-codex".to_string(),
+                        route_group: "gpt-5-codex".to_string(),
+                        provider_kind: "openai_codex".to_string(),
+                        upstream_model: "gpt-5-codex".to_string(),
+                        capabilities: vec![
+                            ModelCapability::Chat,
+                            ModelCapability::Responses,
+                            ModelCapability::Streaming,
+                        ],
+                    }],
+                    supports_refresh: true,
+                    supports_quota_probe: false,
+                },
+            )
+            .await
+            .expect("rate limited account");
+        let healthy = state
+            .store
+            .ingest_provider_account(
+                ProviderAccountEnvelope {
+                    provider: "openai_codex".to_string(),
+                    credential_kind: "oauth_tokens".to_string(),
+                    payload_version: "v1".to_string(),
+                    credentials: json!({
+                        "access_token": "gateway-codex-token",
+                        "account_id": "acct_gateway_codex_ok",
+                        "api_base": healthy_api_base
+                    }),
+                    metadata: json!({ "email": "healthy@example.com" }),
+                    labels: vec![],
+                    tags: BTreeMap::new(),
+                },
+                ValidatedProviderAccount {
+                    provider_account_id: "acct_gateway_codex_ok".to_string(),
+                    redacted_display: Some("h***@***".to_string()),
+                    expires_at: None,
+                },
+                AccountCapabilities {
+                    models: vec![ModelDescriptor {
+                        id: "gpt-5-codex".to_string(),
+                        route_group: "gpt-5-codex".to_string(),
+                        provider_kind: "openai_codex".to_string(),
+                        upstream_model: "gpt-5-codex".to_string(),
+                        capabilities: vec![
+                            ModelCapability::Chat,
+                            ModelCapability::Responses,
+                            ModelCapability::Streaming,
+                        ],
+                    }],
+                    supports_refresh: true,
+                    supports_quota_probe: false,
+                },
+            )
+            .await
+            .expect("healthy account");
+        let route_group = state
+            .store
+            .create_route_group(
+                "gpt-5-codex".to_string(),
+                "openai_codex".to_string(),
+                "gpt-5-codex".to_string(),
+            )
+            .await
+            .expect("route group");
+        state
+            .store
+            .bind_provider_account(route_group.id, rate_limited.id, 100, 16)
+            .await
+            .expect("rate limited binding");
+        state
+            .store
+            .bind_provider_account(route_group.id, healthy.id, 10, 16)
+            .await
+            .expect("healthy binding");
+        state
+    }
+
+    async fn state_with_anthropic_route(api_base: &str) -> GatewayAppState {
+        let state = GatewayAppState::demo();
+        let account = state
+            .store
+            .ingest_provider_account(
+                ProviderAccountEnvelope {
+                    provider: "anthropic".to_string(),
+                    credential_kind: "api_key".to_string(),
+                    payload_version: "v1".to_string(),
+                    credentials: json!({
+                        "api_key": "gateway-anthropic-key",
+                        "api_base": api_base
+                    }),
+                    metadata: json!({ "workspace": "gateway-anthropic" }),
+                    labels: vec![],
+                    tags: BTreeMap::new(),
+                },
+                ValidatedProviderAccount {
+                    provider_account_id: "acct_gateway_anthropic".to_string(),
+                    redacted_display: Some("a***@***".to_string()),
+                    expires_at: None,
+                },
+                AccountCapabilities {
+                    models: vec![ModelDescriptor {
+                        id: "opus-4.5".to_string(),
+                        route_group: "opus-4.5".to_string(),
+                        provider_kind: "anthropic".to_string(),
+                        upstream_model: "claude-opus-4-5".to_string(),
+                        capabilities: vec![ModelCapability::Chat],
+                    }],
+                    supports_refresh: false,
+                    supports_quota_probe: false,
+                },
+            )
+            .await
+            .expect("provider account");
+        let route_group = state
+            .store
+            .create_route_group(
+                "opus-4.5".to_string(),
+                "anthropic".to_string(),
+                "claude-opus-4-5".to_string(),
+            )
+            .await
+            .expect("route group");
+        state
+            .store
+            .bind_provider_account(route_group.id, account.id, 100, 16)
+            .await
+            .expect("binding");
+        state
+    }
+
+    async fn state_with_fallback_route(
+        anthropic_api_base: &str,
+        codex_api_base: &str,
+    ) -> GatewayAppState {
+        let state = GatewayAppState::demo();
+        let anthropic = state
+            .store
+            .ingest_provider_account(
+                ProviderAccountEnvelope {
+                    provider: "anthropic".to_string(),
+                    credential_kind: "api_key".to_string(),
+                    payload_version: "v1".to_string(),
+                    credentials: json!({
+                        "api_key": "gateway-anthropic-key",
+                        "api_base": anthropic_api_base
+                    }),
+                    metadata: json!({}),
+                    labels: vec![],
+                    tags: BTreeMap::new(),
+                },
+                ValidatedProviderAccount {
+                    provider_account_id: "acct_fallback_anthropic".to_string(),
+                    redacted_display: Some("a***".to_string()),
+                    expires_at: None,
+                },
+                AccountCapabilities {
+                    models: vec![ModelDescriptor {
+                        id: "assistant/default".to_string(),
+                        route_group: "assistant-default-anthropic".to_string(),
+                        provider_kind: "anthropic".to_string(),
+                        upstream_model: "claude-sonnet-4-5".to_string(),
+                        capabilities: vec![ModelCapability::Chat],
+                    }],
+                    supports_refresh: false,
+                    supports_quota_probe: false,
+                },
+            )
+            .await
+            .expect("anthropic account");
+        let codex = state
+            .store
+            .ingest_provider_account(
+                ProviderAccountEnvelope {
+                    provider: "openai_codex".to_string(),
+                    credential_kind: "oauth_tokens".to_string(),
+                    payload_version: "v1".to_string(),
+                    credentials: json!({
+                        "access_token": "gateway-codex-token",
+                        "account_id": "acct_gateway_codex_fallback",
+                        "api_base": codex_api_base
+                    }),
+                    metadata: json!({}),
+                    labels: vec![],
+                    tags: BTreeMap::new(),
+                },
+                ValidatedProviderAccount {
+                    provider_account_id: "acct_gateway_codex_fallback".to_string(),
+                    redacted_display: Some("c***".to_string()),
+                    expires_at: None,
+                },
+                AccountCapabilities {
+                    models: vec![ModelDescriptor {
+                        id: "assistant/default".to_string(),
+                        route_group: "assistant-default-codex".to_string(),
+                        provider_kind: "openai_codex".to_string(),
+                        upstream_model: "gpt-5-codex".to_string(),
+                        capabilities: vec![ModelCapability::Chat, ModelCapability::Streaming],
+                    }],
+                    supports_refresh: true,
+                    supports_quota_probe: false,
+                },
+            )
+            .await
+            .expect("codex account");
+
+        let primary_route = state
+            .store
+            .create_route_group(
+                "assistant/default".to_string(),
+                "anthropic".to_string(),
+                "claude-sonnet-4-5".to_string(),
+            )
+            .await
+            .expect("primary route");
+        let fallback_route = state
+            .store
+            .create_route_group(
+                "assistant/default".to_string(),
+                "openai_codex".to_string(),
+                "gpt-5-codex".to_string(),
+            )
+            .await
+            .expect("fallback route");
+        state
+            .store
+            .bind_provider_account(primary_route.id, anthropic.id, 100, 8)
+            .await
+            .expect("primary binding");
+        state
+            .store
+            .bind_provider_account(fallback_route.id, codex.id, 100, 8)
+            .await
+            .expect("fallback binding");
+        state
+            .store
+            .add_route_group_fallback(primary_route.id, fallback_route.id, 0)
+            .await
+            .expect("fallback");
+        assert_eq!(
+            state
+                .store
+                .scheduler_candidates("assistant/default")
+                .await
+                .expect("candidates")
+                .len(),
+            2
+        );
+        let resolved = crate::core::route_resolver::RouteResolver::resolve(
+            &state.store,
+            "assistant/default",
+            crate::core::types::RequestedCapability::Chat,
+        )
+        .await
+        .expect("resolved");
+        assert_eq!(resolved.fallback_chain.len(), 1);
+
+        state
+    }
+
     async fn demo_tenant_id(state: &GatewayAppState) -> uuid::Uuid {
         state
             .store
@@ -1048,6 +1520,289 @@ mod tests {
         assert_eq!(record.provider_kind, "openai_codex");
         assert_eq!(record.status_code, 200);
         assert_eq!(record.usage.total_tokens, 8);
+    }
+
+    #[tokio::test]
+    async fn chat_completions_endpoint_retries_another_provider_account_after_rate_limit() {
+        let rate_limited_addr = spawn_rate_limited_codex_endpoint_server().await;
+        let healthy_addr = spawn_codex_endpoint_server().await;
+        let state = state_with_retryable_codex_route(
+            &format!("http://{rate_limited_addr}/backend-api/codex"),
+            &format!("http://{healthy_addr}/backend-api/codex"),
+        )
+        .await;
+        let app = app(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/v1/chat/completions")
+                    .header(http::header::AUTHORIZATION, "Bearer fgk_demo_gateway_key")
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "gpt-5-codex",
+                            "messages": [{
+                                "role": "user",
+                                "content": "hello"
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(
+            body.pointer("/choices/0/message/content")
+                .and_then(Value::as_str),
+            Some("hello from codex")
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_completions_endpoint_routes_anthropic_public_model_through_openai_ingress() {
+        let addr = spawn_anthropic_messages_server().await;
+        let state = state_with_anthropic_route(&format!("http://{addr}/v1")).await;
+        let app = app(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/v1/chat/completions")
+                    .header(http::header::AUTHORIZATION, "Bearer fgk_demo_gateway_key")
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "opus-4.5",
+                            "messages": [{
+                                "role": "user",
+                                "content": "hello"
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(
+            body.get("object").and_then(Value::as_str),
+            Some("chat.completion")
+        );
+        assert_eq!(
+            body.get("model").and_then(Value::as_str),
+            Some("claude-opus-4-5")
+        );
+        assert_eq!(
+            body.pointer("/choices/0/message/content")
+                .and_then(Value::as_str),
+            Some("hello from anthropic")
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_completions_endpoint_falls_back_to_secondary_provider_route() {
+        let anthropic_addr = spawn_rate_limited_anthropic_messages_server().await;
+        let codex_addr = spawn_codex_endpoint_server().await;
+        let state = state_with_fallback_route(
+            &format!("http://{anthropic_addr}/v1"),
+            &format!("http://{codex_addr}/backend-api/codex"),
+        )
+        .await;
+        let app = app(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/v1/chat/completions")
+                    .header(http::header::AUTHORIZATION, "Bearer fgk_demo_gateway_key")
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "assistant/default",
+                            "messages": [{
+                                "role": "user",
+                                "content": "hello"
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(
+            body.pointer("/choices/0/message/content")
+                .and_then(Value::as_str),
+            Some("hello from codex")
+        );
+        assert_eq!(
+            body.get("model").and_then(Value::as_str),
+            Some("gpt-5.1-codex")
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_completions_streaming_routes_anthropic_public_model_through_openai_ingress() {
+        let addr = spawn_anthropic_streaming_messages_server().await;
+        let state = state_with_anthropic_route(&format!("http://{addr}/v1")).await;
+        let app = app(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/v1/chat/completions")
+                    .header(http::header::AUTHORIZATION, "Bearer fgk_demo_gateway_key")
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "opus-4.5",
+                            "stream": true,
+                            "messages": [{
+                                "role": "user",
+                                "content": "hello"
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body = String::from_utf8_lossy(&body);
+        let payloads = sse_data_payloads(&body);
+        assert!(
+            payloads.iter().any(|payload| payload.contains("hello ")),
+            "expected anthropic delta chunk in {body}"
+        );
+        assert!(
+            payloads.iter().any(|payload| payload.contains("world")),
+            "expected anthropic completion chunk in {body}"
+        );
+        assert!(payloads.iter().any(|payload| payload == "[DONE]"));
+    }
+
+    #[tokio::test]
+    async fn chat_completions_does_not_fallback_on_invalid_credentials() {
+        let anthropic_addr = spawn_unauthorized_anthropic_messages_server().await;
+        let codex_addr = spawn_codex_endpoint_server().await;
+        let state = state_with_fallback_route(
+            &format!("http://{anthropic_addr}/v1"),
+            &format!("http://{codex_addr}/backend-api/codex"),
+        )
+        .await;
+        let app = app(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/v1/chat/completions")
+                    .header(http::header::AUTHORIZATION, "Bearer fgk_demo_gateway_key")
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "assistant/default",
+                            "messages": [{
+                                "role": "user",
+                                "content": "hello"
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(
+            body.pointer("/error/code").and_then(Value::as_str),
+            Some("invalid_credentials")
+        );
+        assert!(
+            body.pointer("/error/message")
+                .and_then(Value::as_str)
+                .is_some_and(|message| message.contains("invalid api key"))
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_endpoint_routes_anthropic_public_model_through_openai_ingress() {
+        let addr = spawn_anthropic_messages_server().await;
+        let state = state_with_anthropic_route(&format!("http://{addr}/v1")).await;
+        let app = app(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/v1/responses")
+                    .header(http::header::AUTHORIZATION, "Bearer fgk_demo_gateway_key")
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "opus-4.5",
+                            "input": "hello"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(body.get("object").and_then(Value::as_str), Some("response"));
+        assert_eq!(
+            body.get("model").and_then(Value::as_str),
+            Some("claude-opus-4-5")
+        );
+        assert_eq!(
+            body.pointer("/output/0/content/0/text")
+                .and_then(Value::as_str),
+            Some("hello from anthropic")
+        );
     }
 
     #[tokio::test]

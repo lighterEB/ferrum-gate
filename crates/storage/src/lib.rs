@@ -213,6 +213,14 @@ pub struct RouteGroupBindingRecord {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RouteGroupFallbackRecord {
+    pub route_group_id: Uuid,
+    pub fallback_route_group_id: Uuid,
+    pub position: u32,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RequestRecord {
     pub id: Uuid,
     pub tenant_id: Uuid,
@@ -741,6 +749,47 @@ impl PlatformStore {
         match self {
             Self::InMemory(store) => store.list_route_group_bindings().await,
             Self::Postgres(store) => store.list_route_group_bindings().await,
+        }
+    }
+
+    pub async fn list_route_groups_for_public_model(
+        &self,
+        public_model: &str,
+    ) -> Result<Vec<RouteGroupRecord>, StoreError> {
+        let route_groups = self.list_route_groups().await?;
+        Ok(route_groups
+            .into_iter()
+            .filter(|route_group| route_group.public_model == public_model)
+            .collect())
+    }
+
+    pub async fn add_route_group_fallback(
+        &self,
+        route_group_id: Uuid,
+        fallback_route_group_id: Uuid,
+        position: u32,
+    ) -> Result<RouteGroupFallbackRecord, StoreError> {
+        match self {
+            Self::InMemory(store) => {
+                store
+                    .add_route_group_fallback(route_group_id, fallback_route_group_id, position)
+                    .await
+            }
+            Self::Postgres(store) => {
+                store
+                    .add_route_group_fallback(route_group_id, fallback_route_group_id, position)
+                    .await
+            }
+        }
+    }
+
+    pub async fn list_route_group_fallbacks(
+        &self,
+        route_group_id: Uuid,
+    ) -> Result<Vec<RouteGroupFallbackRecord>, StoreError> {
+        match self {
+            Self::InMemory(store) => store.list_route_group_fallbacks(route_group_id).await,
+            Self::Postgres(store) => store.list_route_group_fallbacks(route_group_id).await,
         }
     }
 

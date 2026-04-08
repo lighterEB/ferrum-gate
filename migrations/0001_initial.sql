@@ -69,6 +69,14 @@ create table if not exists route_group_bindings (
   created_at timestamptz not null default now()
 );
 
+create table if not exists route_group_fallbacks (
+  route_group_id uuid not null references route_groups(id),
+  fallback_route_group_id uuid not null references route_groups(id),
+  position integer not null,
+  created_at timestamptz not null default now(),
+  primary key (route_group_id, fallback_route_group_id)
+);
+
 create table if not exists role_bindings (
   id uuid primary key,
   subject text not null,
@@ -169,3 +177,6 @@ create unique index if not exists route_groups_public_model_provider_kind_idx
 
 create unique index if not exists route_group_bindings_route_group_account_idx
   on route_group_bindings (route_group_id, provider_account_id);
+
+create unique index if not exists route_group_fallbacks_route_group_position_idx
+  on route_group_fallbacks (route_group_id, position);
