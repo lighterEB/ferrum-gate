@@ -24,25 +24,30 @@ function readSection(markdown: string, heading: string) {
 }
 
 describe("public VPS deploy guardrails", () => {
-	it("serves the tenant console shell through nginx with SPA fallback", () => {
-		expect(nginxConfig).toMatch(
-			/try_files\s+\$uri(?:\s+\$uri\/)?\s+\/index\.html\s*;/,
-		);
-
-		for (const route of ["/v1/", "/tenant/", "/internal/"]) {
+	it("proxies all backend routes through nginx", () => {
+		// Backend-only nginx: no SPA, just proxy pass
+		for (const route of [
+			"/v1/",
+			"/tenant/",
+			"/internal/",
+			"/external/",
+			"/health",
+		]) {
 			expect(nginxConfig).toMatch(
 				new RegExp(
-					`location\\s+${escapeRegex(route)}\\s*\\{[\\s\\S]*proxy_pass`,
+					`location\\s+(?:=\\s+)?${escapeRegex(route)}\\s*\\{[\\s\\S]*proxy_pass`,
 				),
 			);
 		}
 	});
 
-	it("wires frontend build artifacts into the nginx runtime image", () => {
-		expect(nginxDockerfile).toMatch(/\/usr\/share\/nginx\/html/);
-		expect(nginxDockerfile).toMatch(
-			/COPY\s+.*index\.html|COPY\s+--from=.*dist/i,
-		);
+	it("keeps nginx backend-only without frontend build stage", () => {
+		// No frontend builder stage
+		expect(nginxDockerfile).not.toMatch(/oven\/bun|frontend-builder/i);
+		// No SPA artifact copy
+		expect(nginxDockerfile).not.toMatch(/COPY\s+--from=.*dist/i);
+		// Still based on nginx
+		expect(nginxDockerfile).toMatch(/FROM nginx/i);
 	});
 
 	it("documents browser-safe public deployment expectations for tenant-console", () => {
