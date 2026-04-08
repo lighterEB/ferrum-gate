@@ -13,6 +13,27 @@ This first milestone is a runnable skeleton that fixes the module boundaries ear
 - future Anthropic-compatible frontend without rewriting the scheduler
 - Postgres-first persistence with a demo in-memory fallback
 
+## Gateway Architecture
+
+The current gateway/codex runtime is being documented before the Wave 1
+refactor moves behavior behind explicit ingress, routing, and execution
+boundaries.
+
+- `apps/gateway-http/src/lib.rs` still combines HTTP ingress, auth, routing
+  lookups, provider selection, OpenAI response shaping, request bookkeeping,
+  and scheduler outcome updates.
+- `crates/provider-openai-codex/src/lib.rs` still combines endpoint selection,
+  request normalization, upstream HTTP transport, stream parsing, and provider
+  response shaping.
+- For ChatGPT Codex upstreams, public `chat/completions` traffic may execute
+  through the provider's upstream `responses` path while FerrumGate still
+  returns OpenAI-compatible chat responses.
+- Provider-account runtime state is scheduler-managed and backed by provider
+  account records rather than being owned by the public HTTP layer.
+
+See `docs/architecture.md` for the current runtime call chain, Wave 1 review
+notes, and the planned Batches 0-3 boundary extraction.
+
 ## Workspace Layout
 
 ```text
