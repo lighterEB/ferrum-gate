@@ -2206,6 +2206,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_completions_endpoint_routes_codex_requests_and_records_usage() {
+        let addr = spawn_codex_endpoint_server().await;
+        let state = state_with_codex_route(&format!("http://{addr}/backend-api/codex")).await;
+        let tenant_id = demo_tenant_id(&state).await;
+        let app = app(state.clone());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/v1/chat/completions")
+                    .header(http::header::AUTHORIZATION, "Bearer fgk_demo_gateway_key")
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "gpt-5-codex",
+                            "messages": [{
+                                "role": "user",
+                                "content": "hello"
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(
+            body.get("object").and_then(Value::as_str),
+            Some("chat.completion")
+        );
+        assert_eq!(
+            body.get("model").and_then(Value::as_str),
+            Some("gpt-5.1-codex")
+        );
+        assert_eq!(
+            body.pointer("/choices/0/message/content")
+                .and_then(Value::as_str),
+            Some("hello from codex")
+        );
+        assert_eq!(
+            body.pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str),
+            Some("stop")
+        );
+        assert_eq!(
+            body.pointer("/usage/total_tokens").and_then(Value::as_u64),
+            Some(8)
+        );
+
+        let requests = state
+            .store
+            .tenant_requests(tenant_id)
+            .await
+            .expect("requests");
+        let record = requests
+            .into_iter()
+            .find(|request| request.public_model == "gpt-5-codex")
+            .expect("recorded request");
+        assert_eq!(record.provider_kind, "openai_codex");
+        assert_eq!(record.status_code, 200);
+        assert_eq!(record.usage.total_tokens, 8);
+    }
+
+    #[tokio::test]
     async fn responses_endpoint_routes_codex_requests_and_records_usage() {
         let addr = spawn_codex_endpoint_server().await;
         let state = state_with_codex_route(&format!("http://{addr}/backend-api/codex")).await;
