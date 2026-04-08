@@ -798,3 +798,373 @@ where
         }
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── openai_message_to_canonical_message ──
+
+    #[test]
+    fn converts_user_text_message() {
+        let msg = OpenAiMessage {
+            role: "user".to_string(),
+            content: OpenAiMessageContent::Text("hello world".to_string()),
+            tool_call_id: None,
+            tool_calls: vec![],
+        };
+        let result = openai_message_to_canonical_message(&msg);
+        assert_eq!(result.role, MessageRole::User);
+        assert_eq!(result.content, "hello world");
+        // Text content is also stored as a ContentPart
+        assert_eq!(result.parts.len(), 1);
+        assert!(matches!(&result.parts[0], ContentPart::Text { text } if text == "hello world"));
+    }
+
+    #[test]
+    fn converts_assistant_message_with_tool_calls() {
+        let msg = OpenAiMessage {
+            role: "assistant".to_string(),
+            content: OpenAiMessageContent::Text("let me help".to_string()),
+            tool_call_id: None,
+            tool_calls: vec![OpenAiToolCall {
+                id: "call_123".to_string(),
+                tool_type: "function".to_string(),
+                function: OpenAiFunctionCall {
+                    name: "get_weather".to_string(),
+                    arguments: r#"{"city":"tokyo"}"#.to_string(),
+                },
+            }],
+        };
+        let result = openai_message_to_canonical_message(&msg);
+        assert_eq!(result.role, MessageRole::Assistant);
+        assert_eq!(result.content, "let me help");
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].id, "call_123");
+        assert_eq!(result.tool_calls[0].name, "get_weather");
+    }
+
+    #[test]
+    fn converts_tool_result_message() {
+        let msg = OpenAiMessage {
+            role: "tool".to_string(),
+            content: OpenAiMessageContent::Text("sunny, 25C".to_string()),
+            tool_call_id: Some("call_123".to_string()),
+            tool_calls: vec![],
+        };
+        let result = openai_message_to_canonical_message(&msg);
+        assert_eq!(result.role, MessageRole::Tool);
+        assert_eq!(result.content, "sunny, 25C");
+        assert_eq!(result.tool_call_id.as_deref(), Some("call_123"));
+    }
+
+    #[test]
+    fn converts_multi_part_content_with_image() {
+        let msg = OpenAiMessage {
+            role: "user".to_string(),
+            content: OpenAiMessageContent::Parts(vec![OpenAiContentPart {
+                part_type: "image_url".to_string(),
+                text: None,
+                image_url: Some(json!({"url": "https://example.com/img.png"})),
+            }]),
+            tool_call_id: None,
+            tool_calls: vec![],
+        };
+        let result = openai_message_to_canonical_message(&msg);
+        assert_eq!(result.role, MessageRole::User);
+        assert_eq!(result.parts.len(), 1);
+        assert!(
+            matches!(&result.parts[0], ContentPart::ImageUrl { image_url } if image_url == "https://example.com/img.png")
+        );
+    }
+
+    // ── openai_tools_to_canonical_tools ──
+
+    #[test]
+    fn converts_openai_tools_to_canonical() {
+        let tools = vec![
+            OpenAiToolDefinition {
+                tool_type: "function".to_string(),
+                function: OpenAiFunctionDefinition {
+                    name: "get_weather".to_string(),
+                    description: Some("Get weather".to_string()),
+                    parameters: json!({"type": "object"}),
+                },
+            },
+            OpenAiToolDefinition {
+                tool_type: "code_interpreter".to_string(),
+                function: OpenAiFunctionDefinition {
+                    name: "ignored".to_string(),
+                    description: None,
+                    parameters: json!({}),
+                },
+            },
+        ];
+        let result = openai_tools_to_canonical_tools(&tools);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "get_weather");
+    }
+
+    // ── responses_input_to_messages ──
+
+    #[test]
+    fn responses_input_string_becomes_user_message() {
+        let input = Value::String("tell me a joke".to_string());
+        let result = responses_input_to_messages(input);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].role, MessageRole::User);
+        assert_eq!(result[0].content, "tell me a joke");
+    }
+
+    #[test]
+    fn responses_input_array_parses_message_items() {
+        let input = json!([
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi there"}
+        ]);
+        let result = responses_input_to_messages(input);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].role, MessageRole::User);
+        assert_eq!(result[1].role, MessageRole::Assistant);
+    }
+
+    #[test]
+    fn responses_input_function_call_item_becomes_assistant_message() {
+        let input = json!([
+            {
+                "type": "function_call",
+                "id": "fc_1",
+                "name": "get_weather",
+                "arguments": {"city": "tokyo"},
+                "call_id": "call_1"
+            }
+        ]);
+        let result = responses_input_to_messages(input);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].role, MessageRole::Assistant);
+        assert_eq!(result[0].tool_calls.len(), 1);
+        assert_eq!(result[0].tool_calls[0].name, "get_weather");
+    }
+
+    #[test]
+    fn responses_input_function_call_output_item_becomes_tool_message() {
+        let input = json!([
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "sunny, 25C"
+            }
+        ]);
+        let result = responses_input_to_messages(input);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].role, MessageRole::Tool);
+        assert_eq!(result[0].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(result[0].content, "sunny, 25C");
+    }
+
+    #[test]
+    fn responses_input_non_string_non_array_becomes_user_message() {
+        let input = Value::Number(42.into());
+        let result = responses_input_to_messages(input);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].role, MessageRole::User);
+        assert_eq!(result[0].content, "42");
+    }
+
+    // ── deserialize_optional_string_placeholder ──
+
+    #[test]
+    fn placeholder_undefined_becomes_none_via_request() {
+        // The deserialize_optional_string_placeholder is used in ResponsesRequest.previous_response_id
+        // Test through the actual request deserialization
+        let json = r#"{"model":"gpt-5","input":"hello","previous_response_id":"[undefined]"}"#;
+        let req: ResponsesRequest = serde_json::from_str(json).expect("valid request");
+        assert!(req.previous_response_id.is_none());
+    }
+
+    #[test]
+    fn normal_string_value_is_preserved_via_request() {
+        let json = r#"{"model":"gpt-5","input":"hello","previous_response_id":"resp_abc123"}"#;
+        let req: ResponsesRequest = serde_json::from_str(json).expect("valid request");
+        assert_eq!(req.previous_response_id.as_deref(), Some("resp_abc123"));
+    }
+
+    #[test]
+    fn null_value_becomes_none_via_request() {
+        let json = r#"{"model":"gpt-5","input":"hello","previous_response_id":null}"#;
+        let req: ResponsesRequest = serde_json::from_str(json).expect("valid request");
+        assert!(req.previous_response_id.is_none());
+    }
+
+    // ── provider_error_body ──
+
+    #[test]
+    fn error_body_invalid_request_maps_to_invalid_request_error() {
+        let error = ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            400,
+            "bad param".to_string(),
+        );
+        let body = provider_error_body(&error);
+        assert_eq!(body["type"], "invalid_request_error");
+        assert_eq!(body["code"], "invalid_request");
+        assert_eq!(body["message"], "bad param");
+        assert!(body["param"].is_null());
+    }
+
+    #[test]
+    fn error_body_invalid_credentials_maps_to_invalid_request_error() {
+        let error = ProviderError::new(
+            ProviderErrorKind::InvalidCredentials,
+            401,
+            "wrong key".to_string(),
+        );
+        let body = provider_error_body(&error);
+        assert_eq!(body["type"], "invalid_request_error");
+        assert_eq!(body["code"], "invalid_credentials");
+    }
+
+    #[test]
+    fn error_body_rate_limited_maps_to_rate_limit_error() {
+        let error = ProviderError::new(ProviderErrorKind::RateLimited, 429, "too many".to_string());
+        let body = provider_error_body(&error);
+        assert_eq!(body["type"], "rate_limit_error");
+        assert_eq!(body["code"], "rate_limited");
+    }
+
+    #[test]
+    fn error_body_upstream_unavailable_maps_to_server_error() {
+        let error = ProviderError::new(
+            ProviderErrorKind::UpstreamUnavailable,
+            502,
+            "upstream down".to_string(),
+        );
+        let body = provider_error_body(&error);
+        assert_eq!(body["type"], "server_error");
+        assert_eq!(body["code"], "upstream_unavailable");
+    }
+
+    #[test]
+    fn error_body_unsupported_maps_to_invalid_request_error() {
+        let error = ProviderError::new(
+            ProviderErrorKind::Unsupported,
+            400,
+            "not supported".to_string(),
+        );
+        let body = provider_error_body(&error);
+        assert_eq!(body["type"], "invalid_request_error");
+        assert_eq!(body["code"], "unsupported");
+    }
+
+    #[test]
+    fn error_body_uses_custom_code_when_provided() {
+        let error = ProviderError::new(ProviderErrorKind::InvalidRequest, 400, "err".to_string())
+            .with_code("custom_code");
+        let body = provider_error_body(&error);
+        assert_eq!(body["code"], "custom_code");
+    }
+
+    // ── chat_completion_json ──
+
+    #[test]
+    fn chat_completion_json_has_correct_structure() {
+        let response = InferenceResponse {
+            id: "chatcmpl_test".to_string(),
+            created_at: Utc::now(),
+            model: "gpt-4".to_string(),
+            provider_kind: "openai_codex".to_string(),
+            output_text: "Hello!".to_string(),
+            tool_calls: vec![],
+            finish_reason: FinishReason::Stop,
+            usage: protocol_core::TokenUsage {
+                input_tokens: 5,
+                output_tokens: 3,
+                total_tokens: 8,
+            },
+        };
+        let json = chat_completion_json(response);
+        assert_eq!(json["object"], "chat.completion");
+        assert_eq!(json["choices"][0]["message"]["role"], "assistant");
+        assert_eq!(json["choices"][0]["message"]["content"], "Hello!");
+        assert!(json["choices"][0]["message"]["tool_calls"].is_null());
+        assert_eq!(json["choices"][0]["finish_reason"], "stop");
+        assert_eq!(json["usage"]["total_tokens"], 8);
+    }
+
+    #[test]
+    fn chat_completion_json_content_is_null_when_only_tool_calls() {
+        let response = InferenceResponse {
+            id: "chatcmpl_test".to_string(),
+            created_at: Utc::now(),
+            model: "gpt-4".to_string(),
+            provider_kind: "openai_codex".to_string(),
+            output_text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "call_1".to_string(),
+                name: "tool".to_string(),
+                arguments: "{}".to_string(),
+            }],
+            finish_reason: FinishReason::ToolCalls,
+            usage: protocol_core::TokenUsage {
+                input_tokens: 5,
+                output_tokens: 2,
+                total_tokens: 7,
+            },
+        };
+        let json = chat_completion_json(response);
+        assert!(json["choices"][0]["message"]["content"].is_null());
+        assert!(!json["choices"][0]["message"]["tool_calls"].is_null());
+        assert_eq!(json["choices"][0]["finish_reason"], "tool_calls");
+    }
+
+    // ── responses_json ──
+
+    #[test]
+    fn responses_json_has_correct_structure() {
+        let response = InferenceResponse {
+            id: "resp_test".to_string(),
+            created_at: Utc::now(),
+            model: "gpt-5-codex".to_string(),
+            provider_kind: "openai_codex".to_string(),
+            output_text: "Response text".to_string(),
+            tool_calls: vec![],
+            finish_reason: FinishReason::Stop,
+            usage: protocol_core::TokenUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+                total_tokens: 15,
+            },
+        };
+        let json = responses_json(response);
+        assert_eq!(json["object"], "response");
+        assert_eq!(json["output"][0]["type"], "message");
+        assert_eq!(json["output"][0]["role"], "assistant");
+        assert_eq!(json["usage"]["total_tokens"], 15);
+    }
+
+    #[test]
+    fn responses_json_includes_tool_call_outputs() {
+        let response = InferenceResponse {
+            id: "resp_test".to_string(),
+            created_at: Utc::now(),
+            model: "gpt-5-codex".to_string(),
+            provider_kind: "openai_codex".to_string(),
+            output_text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "call_1".to_string(),
+                name: "get_weather".to_string(),
+                arguments: r#"{"city":"tokyo"}"#.to_string(),
+            }],
+            finish_reason: FinishReason::ToolCalls,
+            usage: protocol_core::TokenUsage {
+                input_tokens: 5,
+                output_tokens: 2,
+                total_tokens: 7,
+            },
+        };
+        let json = responses_json(response);
+        assert_eq!(json["output"][0]["type"], "function_call");
+        assert_eq!(json["output"][0]["name"], "get_weather");
+        assert_eq!(json["output"][0]["call_id"], "call_1");
+    }
+}

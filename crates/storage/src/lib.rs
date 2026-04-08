@@ -793,6 +793,17 @@ impl PlatformStore {
         }
     }
 
+    /// Fetch all route-group fallback records in a single query, grouped by parent route_group_id.
+    /// Used to avoid N+1 queries when resolving routes.
+    pub async fn list_all_route_group_fallbacks(
+        &self,
+    ) -> Result<Vec<RouteGroupFallbackRecord>, StoreError> {
+        match self {
+            Self::InMemory(store) => store.list_all_route_group_fallbacks().await,
+            Self::Postgres(store) => store.list_all_route_group_fallbacks().await,
+        }
+    }
+
     pub async fn bind_provider_account(
         &self,
         route_group_id: Uuid,

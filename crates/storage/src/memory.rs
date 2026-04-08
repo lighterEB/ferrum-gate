@@ -1086,6 +1086,29 @@ impl InMemoryPlatformStore {
         Ok(fallbacks)
     }
 
+    pub async fn list_all_route_group_fallbacks(
+        &self,
+    ) -> Result<Vec<RouteGroupFallbackRecord>, StoreError> {
+        let mut fallbacks = self
+            .inner
+            .route_group_fallbacks
+            .read()
+            .await
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        fallbacks.sort_by(|left, right| {
+            left.route_group_id
+                .cmp(&right.route_group_id)
+                .then(left.position.cmp(&right.position))
+                .then(
+                    left.fallback_route_group_id
+                        .cmp(&right.fallback_route_group_id),
+                )
+        });
+        Ok(fallbacks)
+    }
+
     pub async fn bind_provider_account(
         &self,
         route_group_id: Uuid,

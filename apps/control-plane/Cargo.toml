@@ -11,7 +11,9 @@ anyhow.workspace = true
 axum.workspace = true
 chrono.workspace = true
 http.workspace = true
+http-utils = { path = "../../crates/http-utils" }
 observability = { path = "../../crates/observability" }
+provider-anthropic = { path = "../../crates/provider-anthropic" }
 provider-core = { path = "../../crates/provider-core" }
 provider-openai-codex = { path = "../../crates/provider-openai-codex" }
 reqwest.workspace = true

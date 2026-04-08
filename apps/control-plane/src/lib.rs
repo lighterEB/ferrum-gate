@@ -3,7 +3,7 @@ use axum::{
     Router,
     body::to_bytes,
     extract::{Path, Query, State},
-    http::{HeaderMap, HeaderValue, Method, StatusCode},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json, Response},
     routing::{get, post},
 };
@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{collections::HashSet, net::SocketAddr, sync::Arc};
 use storage::{AuthError, Permission, PlatformStore, ScopeTarget, ServiceAccountPrincipal};
-use tower_http::cors::{AllowOrigin, CorsLayer};
+use tower_http::cors::CorsLayer;
 use tracing::info;
 use uuid::Uuid;
 
@@ -133,30 +133,7 @@ pub async fn run(addr: SocketAddr, state: ControlPlaneState) -> Result<()> {
 }
 
 fn console_cors_layer() -> Option<CorsLayer> {
-    let allowed_origins = std::env::var("FERRUMGATE_CONSOLE_ALLOWED_ORIGINS")
-        .or_else(|_| std::env::var("FERRUMGATE_TENANT_API_ALLOWED_ORIGINS"))
-        .ok()?;
-    let origins = allowed_origins
-        .split(',')
-        .map(str::trim)
-        .filter(|origin| !origin.is_empty())
-        .map(HeaderValue::from_str)
-        .collect::<Result<Vec<_>, _>>()
-        .ok()?;
-
-    if origins.is_empty() {
-        return None;
-    }
-
-    Some(
-        CorsLayer::new()
-            .allow_origin(AllowOrigin::list(origins))
-            .allow_methods([Method::GET, Method::POST])
-            .allow_headers([
-                axum::http::header::AUTHORIZATION,
-                axum::http::header::CONTENT_TYPE,
-            ]),
-    )
+    http_utils::console_cors_layer_from_env()
 }
 
 async fn import_provider_account(

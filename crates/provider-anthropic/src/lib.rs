@@ -234,7 +234,24 @@ impl AnthropicProvider {
             let mut usage = TokenUsage::default();
             let mut finish_reason = FinishReason::Stop;
 
-            while let Some(chunk) = bytes.next().await {
+            loop {
+                let chunk = match tokio::time::timeout(
+                    provider_core::STREAM_IDLE_TIMEOUT,
+                    bytes.next(),
+                )
+                .await
+                {
+                    Ok(Some(chunk)) => chunk,
+                    Ok(None) => break,
+                    Err(_) => {
+                        yield Err(ProviderError::new(
+                            ProviderErrorKind::UpstreamUnavailable,
+                            504,
+                            "stream idle timeout exceeded".to_string(),
+                        ));
+                        return;
+                    }
+                };
                 let chunk = match chunk {
                     Ok(chunk) => chunk,
                     Err(error) => {
@@ -840,5 +857,17 @@ mod tests {
         let final_response = final_response.expect("final response");
         assert_eq!(final_response.output_text, "hello world");
         assert_eq!(final_response.model, "claude-opus-4-5");
+    }
+
+    #[test]
+    fn stream_idle_timeout_error_has_correct_shape() {
+        let error = ProviderError::new(
+            ProviderErrorKind::UpstreamUnavailable,
+            504,
+            "stream idle timeout exceeded".to_string(),
+        );
+        assert_eq!(error.kind, ProviderErrorKind::UpstreamUnavailable);
+        assert_eq!(error.status_code, 504);
+        assert_eq!(error.message, "stream idle timeout exceeded");
     }
 }

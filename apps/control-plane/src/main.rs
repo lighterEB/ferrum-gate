@@ -1,5 +1,6 @@
 use anyhow::Result;
 use control_plane::{ControlPlaneState, run};
+use provider_anthropic::AnthropicProvider;
 use provider_core::ProviderRegistry;
 use provider_openai_codex::OpenAiCodexProvider;
 use std::sync::Arc;
@@ -13,6 +14,7 @@ async fn main() -> Result<()> {
         .parse()?;
     let store = PlatformStore::from_env_or_demo().await?;
     let mut registry = ProviderRegistry::new();
+    registry.register(AnthropicProvider::shared(Arc::new(store.clone())));
     registry.register(OpenAiCodexProvider::shared(Arc::new(store.clone())));
     let state = ControlPlaneState { store, registry };
     run(addr, state).await

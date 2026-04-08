@@ -4,11 +4,14 @@ use futures::stream::BoxStream;
 use protocol_core::{InferenceRequest, InferenceResponse, InferenceStreamEvent, ModelDescriptor};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::BTreeMap, fmt, sync::Arc};
+use std::{collections::BTreeMap, fmt, sync::Arc, time::Duration};
 use thiserror::Error;
 use uuid::Uuid;
 
 pub type ProviderStream = BoxStream<'static, Result<InferenceStreamEvent, ProviderError>>;
+
+/// Maximum idle duration between SSE frames before the stream is considered timed out.
+pub const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ProviderAccountEnvelope {

@@ -3,6 +3,7 @@ members = [
   "apps/control-plane",
   "apps/gateway-http",
   "apps/tenant-api",
+  "crates/http-utils",
   "crates/observability",
   "crates/protocol-core",
   "crates/provider-core",

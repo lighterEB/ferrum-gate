@@ -253,4 +253,115 @@ mod tests {
         );
         assert!(runtime.is_schedulable(recovered_at));
     }
+
+    #[test]
+    fn invalid_credentials_moves_to_terminal_state_and_zeroes_health() {
+        let now = Utc::now();
+        let mut runtime = AccountRuntime::new(AccountState::Active, 8);
+        runtime.apply_outcome(ProviderOutcome::InvalidCredentials, now);
+
+        assert_eq!(runtime.state, AccountState::InvalidCredentials);
+        assert_eq!(runtime.health_score, 0);
+        assert_eq!(runtime.consecutive_failures, 1);
+        assert!(!runtime.is_schedulable(now));
+    }
+
+    #[test]
+    fn quota_exhausted_moves_to_quota_state_and_reduces_health() {
+        let now = Utc::now();
+        let mut runtime = AccountRuntime::new(AccountState::Active, 8);
+        runtime.apply_outcome(ProviderOutcome::QuotaExhausted, now);
+
+        assert_eq!(runtime.state, AccountState::QuotaExhausted);
+        assert_eq!(runtime.health_score, 75); // 100 - 25
+        assert_eq!(runtime.consecutive_failures, 1);
+        assert!(!runtime.is_schedulable(now));
+    }
+
+    #[test]
+    fn is_schedulable_rejected_during_circuit_breaker() {
+        let now = Utc::now();
+        let runtime = AccountRuntime {
+            state: AccountState::Active,
+            health_score: 100,
+            cooldown_until: None,
+            circuit_open_until: Some(now + TimeDelta::seconds(10)),
+            consecutive_failures: 1,
+            in_flight: 0,
+            max_in_flight: 8,
+            last_used_at: None,
+        };
+
+        assert!(!runtime.is_schedulable(now));
+        assert!(runtime.is_schedulable(now + TimeDelta::seconds(11)));
+    }
+
+    #[test]
+    fn is_schedulable_rejected_when_at_max_in_flight() {
+        let now = Utc::now();
+        let runtime = AccountRuntime {
+            state: AccountState::Active,
+            health_score: 100,
+            cooldown_until: None,
+            circuit_open_until: None,
+            consecutive_failures: 0,
+            in_flight: 8,
+            max_in_flight: 8,
+            last_used_at: None,
+        };
+
+        assert!(!runtime.is_schedulable(now));
+    }
+
+    #[test]
+    fn is_schedulable_rejected_when_not_active() {
+        let now = Utc::now();
+
+        for state in [
+            AccountState::PendingValidation,
+            AccountState::Cooling,
+            AccountState::Draining,
+            AccountState::QuotaExhausted,
+            AccountState::InvalidCredentials,
+            AccountState::Disabled,
+        ] {
+            let runtime = AccountRuntime {
+                state: state.clone(),
+                health_score: 100,
+                cooldown_until: None,
+                circuit_open_until: None,
+                consecutive_failures: 0,
+                in_flight: 0,
+                max_in_flight: 8,
+                last_used_at: None,
+            };
+            assert!(
+                !runtime.is_schedulable(now),
+                "{state:?} should not be schedulable"
+            );
+        }
+    }
+
+    #[test]
+    fn success_from_cooling_restores_active_and_clears_cooldown() {
+        let now = Utc::now();
+        let mut runtime = AccountRuntime {
+            state: AccountState::Cooling,
+            health_score: 85,
+            cooldown_until: Some(now + TimeDelta::minutes(5)),
+            circuit_open_until: None,
+            consecutive_failures: 1,
+            in_flight: 0,
+            max_in_flight: 8,
+            last_used_at: None,
+        };
+
+        runtime.apply_outcome(ProviderOutcome::Success, now);
+
+        assert_eq!(runtime.state, AccountState::Active);
+        assert_eq!(runtime.health_score, 87); // 85 + 2
+        assert!(runtime.cooldown_until.is_none());
+        assert_eq!(runtime.consecutive_failures, 0);
+        assert!(runtime.is_schedulable(now));
+    }
 }

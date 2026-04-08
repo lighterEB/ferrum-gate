@@ -7,4 +7,6 @@ playwright-report
 test-results
 coverage
 .vite
+.ai/
 .omx/
+.qwen/

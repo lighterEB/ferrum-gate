@@ -13,28 +13,7 @@ server {
         proxy_set_header X-Forwarded-Proto $scheme;
     }
 
-    location /assets/ {
-        root /usr/share/nginx/html;
-        expires 1h;
-        add_header Cache-Control "public, max-age=3600";
-    }
-
-    location = / {
-
-        root /usr/share/nginx/html;
-        try_files /index.html =404;
-    }
-
-    location / {
-
-        root /usr/share/nginx/html;
-        try_files $uri $uri/ /index.html;
-    }
-
     location /tenant/ {
-        if ($http_authorization != "${EXPECTED_AUTH_HEADER}") {
-            return 401 '{"error": {"code": "unauthorized", "message": "Invalid console credentials"}}';
-        }
         proxy_pass http://tenant-api:3006;
         proxy_http_version 1.1;
         proxy_read_timeout 300s;
@@ -46,9 +25,6 @@ server {
     }
 
     location /internal/ {
-        if ($http_authorization != "${EXPECTED_AUTH_HEADER}") {
-            return 401 '{"error": {"code": "unauthorized", "message": "Invalid console credentials"}}';
-        }
         proxy_pass http://control-plane:3007;
         proxy_http_version 1.1;
         proxy_read_timeout 300s;
@@ -60,9 +36,6 @@ server {
     }
 
     location /external/ {
-        if ($http_authorization != "${EXPECTED_AUTH_HEADER}") {
-            return 401 '{"error": {"code": "unauthorized", "message": "Invalid console credentials"}}';
-        }
         proxy_pass http://control-plane:3007;
         proxy_http_version 1.1;
         proxy_read_timeout 300s;

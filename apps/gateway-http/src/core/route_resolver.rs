@@ -52,12 +52,17 @@ async fn select_primary_route_group(
     public_model: &str,
     route_groups: &[storage::RouteGroupRecord],
 ) -> Result<storage::RouteGroupRecord, ExecutionError> {
+    // Fetch all fallbacks in a single query to avoid N+1.
+    let all_fallbacks = store
+        .list_all_route_group_fallbacks()
+        .await
+        .map_err(|error| ExecutionError::Internal(error.to_string()))?;
+
     for route_group in route_groups {
-        let fallbacks = store
-            .list_route_group_fallbacks(route_group.id)
-            .await
-            .map_err(|error| ExecutionError::Internal(error.to_string()))?;
-        if !fallbacks.is_empty() {
+        let has_fallbacks = all_fallbacks
+            .iter()
+            .any(|f| f.route_group_id == route_group.id);
+        if has_fallbacks {
             return Ok(route_group.clone());
         }
     }
@@ -245,5 +250,221 @@ mod tests {
         assert_eq!(resolved.fallback_chain.len(), 1);
         assert_eq!(resolved.fallback_chain[0].provider_kind, "openai_codex");
         assert_eq!(resolved.fallback_chain[0].upstream_model, "gpt-5-codex");
+    }
+
+    #[tokio::test]
+    async fn unknown_model_returns_error() {
+        let store = PlatformStore::demo();
+
+        let result =
+            RouteResolver::resolve(&store, "nonexistent-model", RequestedCapability::Chat).await;
+
+        assert!(matches!(result, Err(ExecutionError::UnknownModel)));
+    }
+
+    #[tokio::test]
+    async fn no_route_groups_returns_error() {
+        let store = PlatformStore::demo();
+        // demo() seeds a tenant but no route groups
+        // Without any route groups for the model, resolution should fail
+
+        let result = RouteResolver::resolve(&store, "some-model", RequestedCapability::Chat).await;
+
+        assert!(matches!(result, Err(ExecutionError::UnknownModel)));
+    }
+
+    #[tokio::test]
+    async fn responses_capability_generates_responses_contract() {
+        let store = PlatformStore::demo();
+        let account = store
+            .ingest_provider_account(
+                ProviderAccountEnvelope {
+                    provider: "openai_codex".to_string(),
+                    credential_kind: "oauth_tokens".to_string(),
+                    payload_version: "v1".to_string(),
+                    credentials: json!({
+                        "access_token": "codex-key",
+                        "api_base": "http://codex.example/v1"
+                    }),
+                    metadata: json!({}),
+                    labels: vec![],
+                    tags: BTreeMap::new(),
+                },
+                ValidatedProviderAccount {
+                    provider_account_id: "acct_responses".to_string(),
+                    redacted_display: Some("c***".to_string()),
+                    expires_at: None,
+                },
+                AccountCapabilities {
+                    models: vec![ModelDescriptor {
+                        id: "gpt-5-codex".to_string(),
+                        route_group: "gpt-5-codex".to_string(),
+                        provider_kind: "openai_codex".to_string(),
+                        upstream_model: "gpt-5-codex".to_string(),
+                        capabilities: vec![ModelCapability::Responses],
+                    }],
+                    supports_refresh: true,
+                    supports_quota_probe: false,
+                },
+            )
+            .await
+            .expect("account");
+        let route_group = store
+            .create_route_group(
+                "gpt-5-codex".to_string(),
+                "openai_codex".to_string(),
+                "gpt-5-codex".to_string(),
+            )
+            .await
+            .expect("route group");
+        store
+            .bind_provider_account(route_group.id, account.id, 100, 8)
+            .await
+            .expect("binding");
+
+        let resolved =
+            RouteResolver::resolve(&store, "gpt-5-codex", RequestedCapability::Responses)
+                .await
+                .expect("resolve");
+
+        assert_eq!(
+            resolved.capability_contract,
+            vec![ModelCapability::Responses]
+        );
+    }
+
+    #[tokio::test]
+    async fn select_primary_picks_first_group_with_fallbacks() {
+        let store = PlatformStore::demo();
+
+        // Create two route groups for the same public model
+        let rg_a = store
+            .create_route_group(
+                "multi-route".to_string(),
+                "anthropic".to_string(),
+                "claude-a".to_string(),
+            )
+            .await
+            .expect("rg_a");
+        let rg_b = store
+            .create_route_group(
+                "multi-route".to_string(),
+                "openai_codex".to_string(),
+                "gpt-b".to_string(),
+            )
+            .await
+            .expect("rg_b");
+
+        // Add a fallback to rg_b (so rg_b should be picked as primary)
+        store
+            .add_route_group_fallback(rg_b.id, rg_a.id, 0)
+            .await
+            .expect("fallback");
+
+        let account = store
+            .ingest_provider_account(
+                ProviderAccountEnvelope {
+                    provider: "openai_codex".to_string(),
+                    credential_kind: "oauth_tokens".to_string(),
+                    payload_version: "v1".to_string(),
+                    credentials: json!({
+                        "access_token": "key",
+                        "api_base": "http://example/v1"
+                    }),
+                    metadata: json!({}),
+                    labels: vec![],
+                    tags: BTreeMap::new(),
+                },
+                ValidatedProviderAccount {
+                    provider_account_id: "acct_multi".to_string(),
+                    redacted_display: Some("m***".to_string()),
+                    expires_at: None,
+                },
+                AccountCapabilities {
+                    models: vec![ModelDescriptor {
+                        id: "multi-route".to_string(),
+                        route_group: "multi-route".to_string(),
+                        provider_kind: "openai_codex".to_string(),
+                        upstream_model: "gpt-b".to_string(),
+                        capabilities: vec![ModelCapability::Chat],
+                    }],
+                    supports_refresh: true,
+                    supports_quota_probe: false,
+                },
+            )
+            .await
+            .expect("account");
+        store
+            .bind_provider_account(rg_b.id, account.id, 100, 8)
+            .await
+            .expect("binding");
+
+        let resolved = RouteResolver::resolve(&store, "multi-route", RequestedCapability::Chat)
+            .await
+            .expect("resolve");
+
+        // Should pick rg_b since it has fallbacks
+        assert_eq!(resolved.route_group_id, rg_b.id);
+        assert_eq!(resolved.fallback_chain.len(), 1);
+        assert_eq!(resolved.fallback_chain[0].route_group_id, rg_a.id);
+    }
+
+    #[tokio::test]
+    async fn no_fallbacks_returns_first_available_group() {
+        let store = PlatformStore::demo();
+
+        let rg = store
+            .create_route_group(
+                "solo-route".to_string(),
+                "anthropic".to_string(),
+                "claude-solo".to_string(),
+            )
+            .await
+            .expect("rg");
+
+        let account = store
+            .ingest_provider_account(
+                ProviderAccountEnvelope {
+                    provider: "anthropic".to_string(),
+                    credential_kind: "api_key".to_string(),
+                    payload_version: "v1".to_string(),
+                    credentials: json!({
+                        "api_key": "key",
+                        "api_base": "http://anthropic.example/v1"
+                    }),
+                    metadata: json!({}),
+                    labels: vec![],
+                    tags: BTreeMap::new(),
+                },
+                ValidatedProviderAccount {
+                    provider_account_id: "acct_solo".to_string(),
+                    redacted_display: Some("s***".to_string()),
+                    expires_at: None,
+                },
+                AccountCapabilities {
+                    models: vec![ModelDescriptor {
+                        id: "solo-route".to_string(),
+                        route_group: "solo-route".to_string(),
+                        provider_kind: "anthropic".to_string(),
+                        upstream_model: "claude-solo".to_string(),
+                        capabilities: vec![ModelCapability::Chat],
+                    }],
+                    supports_refresh: false,
+                    supports_quota_probe: false,
+                },
+            )
+            .await
+            .expect("account");
+        store
+            .bind_provider_account(rg.id, account.id, 100, 8)
+            .await
+            .expect("binding");
+
+        let resolved = RouteResolver::resolve(&store, "solo-route", RequestedCapability::Chat)
+            .await
+            .expect("resolve");
+
+        assert_eq!(resolved.route_group_id, rg.id);
+        assert!(resolved.fallback_chain.is_empty());
     }
 }

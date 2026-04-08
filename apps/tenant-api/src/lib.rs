@@ -2,7 +2,7 @@ use anyhow::Result;
 use axum::{
     Router,
     extract::{Path, State},
-    http::{HeaderMap, HeaderValue, Method, StatusCode},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json, Response},
     routing::{get, post},
 };
@@ -10,7 +10,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::net::SocketAddr;
 use storage::{AuthError, PlatformStore, TenantManagementPrincipal};
-use tower_http::cors::{AllowOrigin, CorsLayer};
+use tower_http::cors::CorsLayer;
 use tracing::info;
 use uuid::Uuid;
 
@@ -228,25 +228,7 @@ fn auth_error_response(error: AuthError) -> Response {
 }
 
 fn tenant_api_cors_layer() -> Option<CorsLayer> {
-    let allowed_origins = std::env::var("FERRUMGATE_TENANT_API_ALLOWED_ORIGINS").ok()?;
-    let origins = allowed_origins
-        .split(',')
-        .map(str::trim)
-        .filter(|origin| !origin.is_empty())
-        .map(HeaderValue::from_str)
-        .collect::<Result<Vec<_>, _>>()
-        .ok()?;
-
-    if origins.is_empty() {
-        return None;
-    }
-
-    Some(
-        CorsLayer::new()
-            .allow_origin(AllowOrigin::list(origins))
-            .allow_methods([Method::GET, Method::POST])
-            .allow_headers([http::header::AUTHORIZATION, http::header::CONTENT_TYPE]),
-    )
+    http_utils::tenant_api_cors_layer_from_env()
 }
 
 trait ResponseExt {
@@ -270,7 +252,7 @@ mod tests {
     use super::*;
     use axum::{
         body::{Body, to_bytes},
-        http::{Request, header},
+        http::{Method, Request, header},
     };
     use std::sync::OnceLock;
     use tokio::sync::Mutex;

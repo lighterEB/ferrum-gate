@@ -22,7 +22,7 @@ use scheduler::{AccountRuntime, AccountState, ProviderOutcome, select_candidate}
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{
-    Executor, PgPool, Row,
+    PgPool, Row,
     postgres::{PgPoolOptions, PgRow},
     types::Json,
 };
@@ -33,6 +33,28 @@ const DEFAULT_MASTER_KEY: &str = "ferrum-gate-development-master-key";
 const DEMO_PROVIDER_ACCOUNT_ID: &str = "00000000-0000-0000-0000-000000000201";
 const DEMO_API_KEY_ID: &str = "00000000-0000-0000-0000-000000000301";
 const DEMO_TENANT_ID: &str = "00000000-0000-0000-0000-000000000001";
+
+/// Ordered list of database migrations.
+///
+/// To add a new migration:
+/// 1. Create `migrations/0002_your_change.sql`
+/// 2. Add a new entry to this array with the next version number
+/// 3. The migration will be applied automatically on next startup
+struct Migration {
+    version: i32,
+    label: &'static str,
+    sql: &'static str,
+}
+
+static MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        label: "initial_schema",
+        sql: include_str!("../../../migrations/0001_initial.sql"),
+    },
+    // Add new migrations here:
+    // Migration { version: 2, label: "your_change", sql: include_str!("../../../migrations/0002_your_change.sql") },
+];
 
 #[derive(Clone)]
 pub struct PostgresPlatformStore {
@@ -77,8 +99,66 @@ impl PostgresPlatformStore {
     }
 
     async fn apply_schema(&self) -> Result<(), StoreError> {
-        self.pool
-            .execute(include_str!("../../../migrations/0001_initial.sql"))
+        self.ensure_migrations_table().await?;
+        let applied = self.applied_migrations().await?;
+
+        for migration in MIGRATIONS {
+            if applied.contains(&migration.version) {
+                continue;
+            }
+            let mut tx = self.pool.begin().await.map_err(store_backend_error)?;
+
+            let result = sqlx::Executor::execute(&mut *tx, migration.sql)
+                .await
+                .map(|_| ())
+                .map_err(store_backend_error);
+
+            if let Err(e) = result {
+                tx.rollback().await.map_err(store_backend_error)?;
+                return Err(e);
+            }
+
+            self.record_migration_applied_in_tx(&mut tx, migration.version, migration.label)
+                .await?;
+
+            tx.commit().await.map_err(store_backend_error)?;
+        }
+
+        Ok(())
+    }
+
+    async fn ensure_migrations_table(&self) -> Result<(), StoreError> {
+        sqlx::query(
+            "create table if not exists _migrations (
+                version     int primary key,
+                label       text not null,
+                applied_at  timestamptz not null default now()
+            )",
+        )
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(store_backend_error)
+    }
+
+    async fn applied_migrations(&self) -> Result<Vec<i32>, StoreError> {
+        let rows = sqlx::query_scalar::<_, i32>("select version from _migrations order by version")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(store_backend_error)?;
+        Ok(rows)
+    }
+
+    async fn record_migration_applied_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        version: i32,
+        label: &str,
+    ) -> Result<(), StoreError> {
+        sqlx::query("insert into _migrations (version, label) values ($1, $2)")
+            .bind(version)
+            .bind(label)
+            .execute(&mut **tx)
             .await
             .map(|_| ())
             .map_err(store_backend_error)
@@ -1217,6 +1297,22 @@ impl PostgresPlatformStore {
              order by position, fallback_route_group_id",
         )
         .bind(route_group_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(store_backend_error)?;
+        rows.into_iter()
+            .map(|row| route_group_fallback_from_row(&row))
+            .collect()
+    }
+
+    pub async fn list_all_route_group_fallbacks(
+        &self,
+    ) -> Result<Vec<RouteGroupFallbackRecord>, StoreError> {
+        let rows = sqlx::query(
+            "select route_group_id, fallback_route_group_id, position, created_at
+             from route_group_fallbacks
+             order by route_group_id, position, fallback_route_group_id",
+        )
         .fetch_all(&self.pool)
         .await
         .map_err(store_backend_error)?;

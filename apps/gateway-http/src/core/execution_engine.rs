@@ -305,3 +305,105 @@ fn fallback_eligible(outcome: ProviderOutcome) -> bool {
             | ProviderOutcome::QuotaExhausted
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fallback_eligible_rate_limited() {
+        assert!(fallback_eligible(ProviderOutcome::RateLimited {
+            retry_after_seconds: Some(30),
+        }));
+    }
+
+    #[test]
+    fn fallback_eligible_rate_limited_no_retry_after() {
+        assert!(fallback_eligible(ProviderOutcome::RateLimited {
+            retry_after_seconds: None,
+        }));
+    }
+
+    #[test]
+    fn fallback_eligible_upstream_failure() {
+        assert!(fallback_eligible(ProviderOutcome::UpstreamFailure));
+    }
+
+    #[test]
+    fn fallback_eligible_transport_failure() {
+        assert!(fallback_eligible(ProviderOutcome::TransportFailure));
+    }
+
+    #[test]
+    fn fallback_eligible_quota_exhausted() {
+        assert!(fallback_eligible(ProviderOutcome::QuotaExhausted));
+    }
+
+    #[test]
+    fn fallback_not_eligible_success() {
+        assert!(!fallback_eligible(ProviderOutcome::Success));
+    }
+
+    #[test]
+    fn fallback_not_eligible_invalid_credentials() {
+        assert!(!fallback_eligible(ProviderOutcome::InvalidCredentials));
+    }
+
+    #[test]
+    fn canonical_request_for_candidate_injects_metadata() {
+        use protocol_core::{CanonicalMessage, FrontendProtocol, InferenceRequest, MessageRole};
+        use std::collections::BTreeMap;
+        use uuid::Uuid;
+
+        let route_group_id = Uuid::new_v4();
+        let account_id = Uuid::new_v4();
+        let route_target = RouteTarget {
+            route_group_id,
+            provider_kind: "openai_codex".to_string(),
+            upstream_model: "gpt-5-codex".to_string(),
+        };
+        let candidate = ProviderAccountCandidate {
+            account_id,
+            route_group_id,
+            provider_kind: "openai_codex".to_string(),
+            weight: 100,
+            runtime: scheduler::AccountRuntime::new(scheduler::AccountState::Active, 8),
+        };
+        let mut metadata = BTreeMap::new();
+        metadata.insert("custom_key".to_string(), "custom_value".to_string());
+        let original = InferenceRequest {
+            protocol: FrontendProtocol::OpenAi,
+            public_model: "gpt-5-codex".to_string(),
+            upstream_model: None,
+            previous_response_id: None,
+            reasoning: None,
+            stream: false,
+            messages: vec![CanonicalMessage {
+                role: MessageRole::User,
+                content: "hello".to_string(),
+                parts: vec![],
+                tool_calls: vec![],
+                tool_call_id: None,
+            }],
+            tools: vec![],
+            metadata,
+        };
+
+        let result = canonical_request_for_candidate(&original, &route_target, &candidate);
+
+        assert_eq!(result.upstream_model.as_deref(), Some("gpt-5-codex"));
+        let meta = &result.metadata;
+        assert_eq!(
+            meta.get("custom_key").map(|s| s.as_str()),
+            Some("custom_value")
+        );
+        assert_eq!(
+            meta.get("provider_account_id").map(|s| s.as_str()),
+            Some(account_id.to_string().as_str())
+        );
+        assert_eq!(
+            meta.get("route_group_id").map(|s| s.as_str()),
+            Some(route_group_id.to_string().as_str())
+        );
+    }
+}
