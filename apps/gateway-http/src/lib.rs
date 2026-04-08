@@ -3071,6 +3071,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn request_id_helper_generates_prefixed_openai_ids() {
+        let id = crate::middleware::request_id::new_openai_object_id("chatcmpl");
+
+        assert!(id.starts_with("chatcmpl_"));
+        assert!(id.len() > "chatcmpl_".len());
+    }
+
     #[tokio::test]
     async fn chat_completions_supports_tool_result_roundtrip() {
         let addr = spawn_codex_chat_tool_result_server().await;
