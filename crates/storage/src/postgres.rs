@@ -99,15 +99,25 @@ impl PostgresPlatformStore {
     }
 
     async fn apply_schema(&self) -> Result<(), StoreError> {
-        self.ensure_migrations_table().await?;
-        let applied = self.applied_migrations().await?;
+        // Serialize schema creation across concurrent app instances.
+        let mut tx = self.pool.begin().await.map_err(store_backend_error)?;
+        sqlx::query("SELECT pg_advisory_xact_lock(1)")
+            .execute(&mut *tx)
+            .await
+            .map_err(store_backend_error)?;
+
+        self.ensure_migrations_table_in_tx(&mut tx).await?;
+
+        let applied =
+            sqlx::query_scalar::<_, i32>("select version from _migrations order by version")
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(store_backend_error)?;
 
         for migration in MIGRATIONS {
             if applied.contains(&migration.version) {
                 continue;
             }
-            let mut tx = self.pool.begin().await.map_err(store_backend_error)?;
-
             let result = sqlx::Executor::execute(&mut *tx, migration.sql)
                 .await
                 .map(|_| ())
@@ -120,14 +130,16 @@ impl PostgresPlatformStore {
 
             self.record_migration_applied_in_tx(&mut tx, migration.version, migration.label)
                 .await?;
-
-            tx.commit().await.map_err(store_backend_error)?;
         }
 
+        tx.commit().await.map_err(store_backend_error)?;
         Ok(())
     }
 
-    async fn ensure_migrations_table(&self) -> Result<(), StoreError> {
+    async fn ensure_migrations_table_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    ) -> Result<(), StoreError> {
         sqlx::query(
             "create table if not exists _migrations (
                 version     int primary key,
@@ -135,18 +147,10 @@ impl PostgresPlatformStore {
                 applied_at  timestamptz not null default now()
             )",
         )
-        .execute(&self.pool)
+        .execute(&mut **tx)
         .await
         .map(|_| ())
         .map_err(store_backend_error)
-    }
-
-    async fn applied_migrations(&self) -> Result<Vec<i32>, StoreError> {
-        let rows = sqlx::query_scalar::<_, i32>("select version from _migrations order by version")
-            .fetch_all(&self.pool)
-            .await
-            .map_err(store_backend_error)?;
-        Ok(rows)
     }
 
     async fn record_migration_applied_in_tx(
