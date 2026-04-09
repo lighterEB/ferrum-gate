@@ -9,6 +9,7 @@ members = [
   "crates/provider-core",
   "crates/provider-anthropic",
   "crates/provider-openai-codex",
+  "crates/provider-qwen",
   "crates/scheduler",
   "crates/storage",
 ]

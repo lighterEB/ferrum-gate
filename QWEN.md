@@ -215,3 +215,23 @@ Note: No automatic scheduled inspection — all probes are manually triggered vi
 - `docs/architecture.md` — System design, Wave 1 review, planned Batch refactoring
 - `AGENTS.md` — Coding conventions and "done when" checklist
 - `README.md` — Full documentation with deployment instructions
+
+## Qwen Added Memories
+- FerrumGate TDD 重构计划 - 剩余未完成工作（Phase 4-5）：
+
+Phase 4: Execution Contracts (Wave 1 Batch 3)
+- 4.1 定义 Execution Contract 类型：ExecutionRequest, ExecutionEvent, ExecutionResult
+- 4.2 提取 ProviderExecutor trait（接收 ExecutionRequest 而非 InferenceRequest，分离执行与协议）
+- 4.3 提取 ProtocolAdapter trait（协议转换与执行分离）
+- 4.4 提取 RouteStore trait（RouteResolver 不再直接依赖 PlatformStore，改用专用路由查询接口）
+
+Phase 5: PlatformStore 重构
+- 5.1 定义 PlatformStore trait 消除 ~50 个方法的 enum dispatch 样板代码（当前每个方法都是 match Self::InMemory/Self::Postgres）
+
+Phase 3 待评估项（未列入计划但已识别）：
+- 自动定时巡检/刷新：当前所有巡检接口（quota probe, account refresh）均为手动 HTTP 触发，无后台周期任务
+- ProviderAdapter trait 接口过大（8+ 方法），应按 ISP 拆分为 discovery / credential / inference 三个 trait
+- 流式总时长超时：当前只有 60s idle 超时，无总时长上限
+- Fallback 上限 3 是硬编码魔术数字
+
+当前测试覆盖：165 tests（后端 159 + 前端 21），全部通过

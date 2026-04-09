@@ -15,6 +15,7 @@ use protocol_core::ModelCapability;
 use provider_anthropic::AnthropicProvider;
 use provider_core::{ProviderError, ProviderErrorKind, ProviderRegistry};
 use provider_openai_codex::OpenAiCodexProvider;
+use provider_qwen::QwenProvider;
 use scheduler::ProviderOutcome;
 use serde_json::{Value, json};
 use std::{net::SocketAddr, sync::Arc};
@@ -35,6 +36,7 @@ impl GatewayAppState {
         let mut registry = ProviderRegistry::new();
         registry.register(AnthropicProvider::shared(Arc::new(store.clone())));
         registry.register(OpenAiCodexProvider::shared(Arc::new(store.clone())));
+        registry.register(QwenProvider::shared(Arc::new(store.clone())));
 
         Self { store, registry }
     }

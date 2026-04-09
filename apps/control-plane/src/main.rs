@@ -3,6 +3,7 @@ use control_plane::{ControlPlaneState, run};
 use provider_anthropic::AnthropicProvider;
 use provider_core::ProviderRegistry;
 use provider_openai_codex::OpenAiCodexProvider;
+use provider_qwen::QwenProvider;
 use std::sync::Arc;
 use storage::PlatformStore;
 
@@ -16,6 +17,7 @@ async fn main() -> Result<()> {
     let mut registry = ProviderRegistry::new();
     registry.register(AnthropicProvider::shared(Arc::new(store.clone())));
     registry.register(OpenAiCodexProvider::shared(Arc::new(store.clone())));
+    registry.register(QwenProvider::shared(Arc::new(store.clone())));
     let state = ControlPlaneState { store, registry };
     run(addr, state).await
 }

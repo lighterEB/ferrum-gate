@@ -379,6 +379,7 @@ dependencies = [
  "provider-anthropic",
  "provider-core",
  "provider-openai-codex",
+ "provider-qwen",
  "reqwest 0.12.28",
  "scheduler",
  "serde",
@@ -824,6 +825,7 @@ dependencies = [
  "provider-anthropic",
  "provider-core",
  "provider-openai-codex",
+ "provider-qwen",
  "scheduler",
  "serde",
  "serde_json",
@@ -1903,6 +1905,28 @@ dependencies = [
  "serde",
  "serde_json",
  "storage",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "provider-qwen"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "axum",
+ "base64",
+ "chrono",
+ "futures",
+ "http",
+ "protocol-core",
+ "provider-core",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "storage",
+ "thiserror 2.0.18",
  "tokio",
  "uuid",
 ]

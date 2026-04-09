@@ -19,6 +19,7 @@ protocol-core = { path = "../../crates/protocol-core" }
 provider-core = { path = "../../crates/provider-core" }
 provider-anthropic = { path = "../../crates/provider-anthropic" }
 provider-openai-codex = { path = "../../crates/provider-openai-codex" }
+provider-qwen = { path = "../../crates/provider-qwen" }
 scheduler = { path = "../../crates/scheduler" }
 serde.workspace = true
 serde_json.workspace = true

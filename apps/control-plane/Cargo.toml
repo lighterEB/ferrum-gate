@@ -16,6 +16,7 @@ observability = { path = "../../crates/observability" }
 provider-anthropic = { path = "../../crates/provider-anthropic" }
 provider-core = { path = "../../crates/provider-core" }
 provider-openai-codex = { path = "../../crates/provider-openai-codex" }
+provider-qwen = { path = "../../crates/provider-qwen" }
 reqwest.workspace = true
 scheduler = { path = "../../crates/scheduler" }
 serde.workspace = true
