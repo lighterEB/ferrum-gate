@@ -148,6 +148,8 @@ impl InMemoryPlatformStore {
             Uuid::parse_str("00000000-0000-0000-0000-000000000001").expect("valid uuid");
         let provider_account_id =
             Uuid::parse_str("00000000-0000-0000-0000-000000000201").expect("valid uuid");
+        let qwen_account_id =
+            Uuid::parse_str("00000000-0000-0000-0000-000000000202").expect("valid uuid");
         let api_key_id =
             Uuid::parse_str("00000000-0000-0000-0000-000000000301").expect("valid uuid");
         let now = Utc::now();
@@ -192,12 +194,47 @@ impl InMemoryPlatformStore {
             created_at: now,
         };
 
+        // Qwen demo account
+        let qwen_provider_account = ProviderAccountRecord {
+            id: qwen_account_id,
+            provider: "qwen".to_string(),
+            credential_kind: "oauth".to_string(),
+            payload_version: "v1".to_string(),
+            state: AccountState::Active,
+            external_account_id: "acct_demo_qwen".to_string(),
+            redacted_display: None,
+            plan_type: None,
+            metadata: json!({
+                "public_model": "coder-model",
+                "upstream_model": "coder-model",
+                "api_base": "https://portal.qwen.ai/v1"
+            }),
+            labels: vec!["shared".to_string(), "prod".to_string()],
+            tags: BTreeMap::from([("region".to_string(), "global".to_string())]),
+            capabilities: vec![
+                "qwen3-coder-plus".to_string(),
+                "qwen3-coder-flash".to_string(),
+                "qwen3.5-plus".to_string(),
+                "qwen3.6-plus".to_string(),
+                "coder-model".to_string(),
+            ],
+            expires_at: None,
+            last_validated_at: Some(now),
+            created_at: now,
+        };
+
         let mut route_groups = BTreeMap::new();
         let mut route_group_bindings = BTreeMap::new();
-        let mut runtimes = HashMap::from([(
-            provider_account_id,
-            AccountRuntime::new(AccountState::Active, AUTO_BINDING_MAX_IN_FLIGHT),
-        )]);
+        let mut runtimes = HashMap::from([
+            (
+                provider_account_id,
+                AccountRuntime::new(AccountState::Active, AUTO_BINDING_MAX_IN_FLIGHT),
+            ),
+            (
+                qwen_account_id,
+                AccountRuntime::new(AccountState::Active, AUTO_BINDING_MAX_IN_FLIGHT),
+            ),
+        ]);
         for model in &provider_account.capabilities {
             ensure_route_group_and_binding_in_maps(
                 &mut route_groups,
@@ -206,6 +243,16 @@ impl InMemoryPlatformStore {
                 &provider_account.provider,
                 model,
                 provider_account_id,
+            );
+        }
+        for model in &qwen_provider_account.capabilities {
+            ensure_route_group_and_binding_in_maps(
+                &mut route_groups,
+                &mut route_group_bindings,
+                &mut runtimes,
+                &qwen_provider_account.provider,
+                model,
+                qwen_account_id,
             );
         }
 
@@ -238,18 +285,29 @@ impl InMemoryPlatformStore {
                     },
                 ),
             ])),
-            provider_accounts: RwLock::new(BTreeMap::from([(
-                provider_account_id,
-                provider_account,
-            )])),
-            provider_credentials: RwLock::new(HashMap::from([(
-                provider_account_id,
-                json!({
-                    "access_token": "demo-access-token",
-                    "account_id": "acct_demo_openai_codex",
-                    "api_base": "https://api.openai.com/v1"
-                }),
-            )])),
+            provider_accounts: RwLock::new(BTreeMap::from([
+                (provider_account_id, provider_account),
+                (qwen_account_id, qwen_provider_account),
+            ])),
+            provider_credentials: RwLock::new(HashMap::from([
+                (
+                    provider_account_id,
+                    json!({
+                        "access_token": "demo-access-token",
+                        "account_id": "acct_demo_openai_codex",
+                        "api_base": "https://api.openai.com/v1"
+                    }),
+                ),
+                (
+                    qwen_account_id,
+                    json!({
+                        "access_token": "vOj-SdwAD18JBCfGy4J3bkYKTZ6a7Ve8a_giUlBvlxy-A-4UH2nevA_ky-XcMXcYZgxeE-C3WK3Efm5ASYLBFg",
+                        "refresh_token": "4-6JvJecdhNrRFQLjbLkwjfukU5gMjEfXC-VQQUEhAanwP21RnHvAf8dywFjrpTh7V9_BZenUaB0VJYrfiIq4tQ",
+                        "resource_url": "portal.qwen.ai",
+                        "api_base": "https://portal.qwen.ai/v1"
+                    }),
+                ),
+            ])),
             route_groups: RwLock::new(route_groups),
             route_group_bindings: RwLock::new(route_group_bindings),
             route_group_fallbacks: RwLock::new(Vec::new()),

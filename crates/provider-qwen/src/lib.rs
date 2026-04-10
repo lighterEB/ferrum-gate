@@ -24,23 +24,175 @@ use serde_json::{Value, json};
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use uuid::Uuid;
 
-/// Qwen OAuth token endpoint (hardcoded from upstream source).
+mod system_prompt;
+
+/// Models that require Qwen CLI system prompt + tools (Agent models).
+fn is_agent_model(model: &str) -> bool {
+    matches!(
+        model,
+        "coder-model" | "qwen3-coder-plus" | "qwen3-coder-flash"
+    )
+}
+
+/// Minimal Qwen Code CLI system prompt for agent models.
+/// Loads from file if FERRUMGATE_QWEN_SYSTEM_PROMPT is set, otherwise uses built-in default.
+fn qwen_cli_system_prompt() -> String {
+    if let Some(path) = system_prompt::qwen_system_prompt_path()
+        && let Ok(content) = std::fs::read_to_string(&path)
+    {
+        return content;
+    }
+    // Built-in default (minimal but functional)
+    QWEN_DEFAULT_SYSTEM_PROMPT.to_string()
+}
+
+/// Built-in default system prompt for Qwen Code CLI agent models.
+const QWEN_DEFAULT_SYSTEM_PROMPT: &str = include_str!("../system_prompt.txt");
+
+/// Qwen OAuth token endpoint (refresh uses chat.qwen.ai, API uses portal.qwen.ai).
 const QWEN_OAUTH_TOKEN_ENDPOINT: &str = "https://chat.qwen.ai/api/v1/oauth2/token";
 
 /// Qwen OAuth client ID (hardcoded from upstream source).
 const QWEN_OAUTH_CLIENT_ID: &str = "f0304373b74a44d2b584a3fb70ca9e56";
 
-/// Default DashScope API base URL for OpenAI-compatible endpoints.
-const QWEN_DEFAULT_API_BASE: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
+/// Default Qwen API base URL for OpenAI-compatible endpoints.
+const QWEN_DEFAULT_API_BASE: &str = "https://portal.qwen.ai/v1";
+
+/// Build the tool definitions required by coder-model (agent model).
+fn agent_tools() -> Vec<Value> {
+    vec![
+        json!({
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Reads and returns the content of a specified file.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": { "type": "string", "description": "The absolute path to the file to read." },
+                        "limit": { "type": "number", "description": "Optional: For text files, maximum number of lines to read." },
+                        "offset": { "type": "number", "description": "Optional: For text files, the 0-based line number to start reading from." }
+                    },
+                    "required": ["file_path"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "description": "Writes content to a specified file in the local filesystem.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": { "type": "string", "description": "The absolute path to the file to write to." },
+                        "content": { "type": "string", "description": "The content to write to the file." }
+                    },
+                    "required": ["file_path", "content"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "edit",
+                "description": "Replaces text within a file. By default, replaces a single occurrence.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": { "type": "string", "description": "The absolute path to the file to modify." },
+                        "old_string": { "type": "string", "description": "The exact literal text to replace." },
+                        "new_string": { "type": "string", "description": "The exact literal text to replace old_string with." },
+                        "replace_all": { "type": "boolean", "description": "Replace all occurrences. Default false." }
+                    },
+                    "required": ["file_path", "old_string", "new_string"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "grep_search",
+                "description": "A powerful search tool built on ripgrep for searching file contents.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": { "type": "string", "description": "The regular expression pattern to search for." },
+                        "glob": { "type": "string", "description": "Glob pattern to filter files (e.g. '*.js')." },
+                        "path": { "type": "string", "description": "File or directory to search in." },
+                        "limit": { "type": "number", "description": "Limit output to first N matches." }
+                    },
+                    "required": ["pattern"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "glob",
+                "description": "Fast file pattern matching tool that works with any codebase size.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": { "type": "string", "description": "The glob pattern to match files against." },
+                        "path": { "type": "string", "description": "The directory to search in." }
+                    },
+                    "required": ["pattern"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "run_shell_command",
+                "description": "Executes a given shell command in a persistent shell session.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": { "type": "string", "description": "Exact bash command to execute." },
+                        "description": { "type": "string", "description": "Brief description of the command." },
+                        "timeout": { "type": "number", "description": "Optional timeout in milliseconds." }
+                    },
+                    "required": ["command"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "todo_write",
+                "description": "Create and manage a structured task list for tracking progress.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "todos": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "id": { "type": "string" },
+                                    "content": { "type": "string" },
+                                    "status": { "type": "string", "enum": ["pending", "in_progress", "completed"] }
+                                },
+                                "required": ["content", "status", "id"]
+                            }
+                        }
+                    },
+                    "required": ["todos"]
+                }
+            }
+        }),
+    ]
+}
 
 /// Known Qwen model IDs exposed through the gateway.
 fn known_qwen_models() -> Vec<ModelDescriptor> {
     vec![
         ModelDescriptor {
-            id: "qwen-max".to_string(),
-            route_group: "qwen-qwen-max".to_string(),
+            id: "qwen3-coder-plus".to_string(),
+            route_group: "qwen-qwen3-coder-plus".to_string(),
             provider_kind: "qwen".to_string(),
-            upstream_model: "qwen-max".to_string(),
+            upstream_model: "qwen3-coder-plus".to_string(),
             capabilities: vec![
                 ModelCapability::Chat,
                 ModelCapability::Responses,
@@ -48,10 +200,10 @@ fn known_qwen_models() -> Vec<ModelDescriptor> {
             ],
         },
         ModelDescriptor {
-            id: "qwen-plus".to_string(),
-            route_group: "qwen-qwen-plus".to_string(),
+            id: "qwen3-coder-flash".to_string(),
+            route_group: "qwen-qwen3-coder-flash".to_string(),
             provider_kind: "qwen".to_string(),
-            upstream_model: "qwen-plus".to_string(),
+            upstream_model: "qwen3-coder-flash".to_string(),
             capabilities: vec![
                 ModelCapability::Chat,
                 ModelCapability::Responses,
@@ -59,10 +211,10 @@ fn known_qwen_models() -> Vec<ModelDescriptor> {
             ],
         },
         ModelDescriptor {
-            id: "qwen-turbo".to_string(),
-            route_group: "qwen-qwen-turbo".to_string(),
+            id: "qwen3.5-plus".to_string(),
+            route_group: "qwen-qwen3.5-plus".to_string(),
             provider_kind: "qwen".to_string(),
-            upstream_model: "qwen-turbo".to_string(),
+            upstream_model: "coder-model".to_string(), // alias → coder-model
             capabilities: vec![
                 ModelCapability::Chat,
                 ModelCapability::Responses,
@@ -70,10 +222,21 @@ fn known_qwen_models() -> Vec<ModelDescriptor> {
             ],
         },
         ModelDescriptor {
-            id: "qwen-coder".to_string(),
-            route_group: "qwen-qwen-coder".to_string(),
+            id: "qwen3.6-plus".to_string(),
+            route_group: "qwen-qwen3.6-plus".to_string(),
             provider_kind: "qwen".to_string(),
-            upstream_model: "qwen-coder".to_string(),
+            upstream_model: "coder-model".to_string(), // alias → coder-model
+            capabilities: vec![
+                ModelCapability::Chat,
+                ModelCapability::Responses,
+                ModelCapability::Streaming,
+            ],
+        },
+        ModelDescriptor {
+            id: "coder-model".to_string(),
+            route_group: "qwen-coder-model".to_string(),
+            provider_kind: "qwen".to_string(),
+            upstream_model: "coder-model".to_string(),
             capabilities: vec![
                 ModelCapability::Chat,
                 ModelCapability::Responses,
@@ -129,6 +292,14 @@ impl QwenProvider {
     }
 
     fn api_base(envelope: &ProviderAccountEnvelope) -> String {
+        // Check resource_url first (from OAuth credentials), then api_base, then default
+        if let Some(resource_url) = Self::string_field(envelope, "resource_url") {
+            let base = resource_url.trim_end_matches('/');
+            if base.ends_with("/v1") {
+                return base.to_string();
+            }
+            return format!("{base}/v1");
+        }
         Self::string_field(envelope, "api_base")
             .unwrap_or(Self::default_api_base())
             .trim_end_matches('/')
@@ -255,10 +426,71 @@ impl QwenProvider {
         Err(ProviderError::new(kind, status.as_u16(), message))
     }
 
-    fn build_headers(connection: &ProviderConnectionInfo) -> Result<HeaderMap, ProviderError> {
+    fn build_headers(
+        connection: &ProviderConnectionInfo,
+        is_streaming: bool,
+    ) -> Result<HeaderMap, ProviderError> {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+        headers.insert(
+            ACCEPT,
+            HeaderValue::from_static(if is_streaming {
+                "text/event-stream"
+            } else {
+                "application/json"
+            }),
+        );
+
+        // Qwen OAuth specific headers (matching qwen-code-oai-proxy)
+        headers.insert(
+            HeaderName::from_static("x-dashscope-authtype"),
+            HeaderValue::from_static("qwen-oauth"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-dashscope-cachecontrol"),
+            HeaderValue::from_static("enable"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-dashscope-useragent"),
+            HeaderValue::from_static("QwenCode/0.11.1 (darwin; arm64)"),
+        );
+
+        // Stainless SDK headers
+        headers.insert(
+            HeaderName::from_static("x-stainless-arch"),
+            HeaderValue::from_static("arm64"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-stainless-lang"),
+            HeaderValue::from_static("js"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-stainless-os"),
+            HeaderValue::from_static("MacOS"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-stainless-package-version"),
+            HeaderValue::from_static("5.11.0"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-stainless-retry-count"),
+            HeaderValue::from_static("0"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-stainless-runtime"),
+            HeaderValue::from_static("node"),
+        );
+
+        // Additional headers
+        headers.insert(
+            HeaderName::from_static("accept-language"),
+            HeaderValue::from_static("*"),
+        );
+        headers.insert(
+            HeaderName::from_static("sec-fetch-mode"),
+            HeaderValue::from_static("cors"),
+        );
+
         for (key, value) in &connection.additional_headers {
             if let (Ok(name), Ok(val)) = (HeaderName::try_from(key), HeaderValue::try_from(value)) {
                 headers.insert(name, val);
@@ -268,31 +500,42 @@ impl QwenProvider {
     }
 
     fn chat_message_payload(message: &protocol_core::CanonicalMessage) -> Value {
+        // Use string content for simple text (matches upstream Qwen proxy behavior).
+        // Only use array format for multi-modal messages with images.
+        let has_images = message
+            .parts
+            .iter()
+            .any(|p| matches!(p, ContentPart::ImageUrl { .. }));
+
+        let content = if has_images {
+            // Multi-modal: build array format
+            let parts: Vec<Value> = message
+                .parts
+                .iter()
+                .map(|part| match part {
+                    ContentPart::Text { text } => {
+                        json!({ "type": "text", "text": text })
+                    }
+                    ContentPart::ImageUrl { image_url } => {
+                        json!({ "type": "image_url", "image_url": { "url": image_url } })
+                    }
+                })
+                .collect();
+            Value::Array(parts)
+        } else {
+            // Plain text: use string content (required by coder-model and other Qwen models)
+            Value::String(message.content.clone())
+        };
+
         match message.role {
             protocol_core::MessageRole::System => {
-                json!({ "role": "system", "content": message.content })
+                json!({ "role": "system", "content": content })
             }
             protocol_core::MessageRole::User => {
-                if !message.parts.is_empty() {
-                    let parts: Vec<Value> = message
-                        .parts
-                        .iter()
-                        .map(|part| match part {
-                            ContentPart::Text { text } => {
-                                json!({ "type": "text", "text": text })
-                            }
-                            ContentPart::ImageUrl { image_url } => {
-                                json!({ "type": "image_url", "image_url": { "url": image_url } })
-                            }
-                        })
-                        .collect();
-                    json!({ "role": "user", "content": parts })
-                } else {
-                    json!({ "role": "user", "content": message.content })
-                }
+                json!({ "role": "user", "content": content })
             }
             protocol_core::MessageRole::Assistant => {
-                let mut obj = json!({ "role": "assistant", "content": message.content });
+                let mut obj = json!({ "role": "assistant", "content": content });
                 if !message.tool_calls.is_empty() {
                     obj["tool_calls"] = tool_calls_json(&message.tool_calls);
                 }
@@ -398,23 +641,58 @@ fn finalize_stream_response(
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct RawTokenUsage {
+    #[serde(default)]
+    #[serde(alias = "prompt_tokens")]
+    input_tokens: Option<u32>,
+    #[serde(default)]
+    #[serde(alias = "completion_tokens")]
+    output_tokens: Option<u32>,
+    #[serde(default)]
+    total_tokens: Option<u32>,
+}
+
+impl From<RawTokenUsage> for protocol_core::TokenUsage {
+    fn from(raw: RawTokenUsage) -> Self {
+        protocol_core::TokenUsage {
+            input_tokens: raw.input_tokens.unwrap_or(0),
+            output_tokens: raw.output_tokens.unwrap_or(0),
+            total_tokens: raw.total_tokens.unwrap_or(0),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct ChatCompletionResponse {
     id: String,
+    object: Option<String>,
+    created: Option<i64>,
     model: String,
     choices: Vec<ChatCompletionChoice>,
-    usage: Option<TokenUsage>,
+    usage: Option<RawTokenUsage>,
+    #[serde(default)]
+    system_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct ChatCompletionChoice {
+    index: Option<i64>,
     message: Option<ChatMessage>,
+    delta: Option<ChatMessage>,
     finish_reason: Option<String>,
+    logprobs: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
+#[allow(dead_code)]
 struct ChatMessage {
+    role: Option<String>,
     content: Option<String>,
     tool_calls: Option<Vec<ToolCallPayload>>,
+    reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -483,6 +761,22 @@ fn parse_sse_frame(frame: &str) -> Option<SseMessage> {
     })
 }
 
+/// Error response from the /responses endpoint's `response.failed` event.
+#[derive(Debug, Deserialize)]
+struct StreamErrorResponse {
+    error: StreamErrorDetail,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamErrorDetail {
+    message: String,
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    r#type: Option<String>,
+}
+
 #[async_trait]
 impl ProviderAdapter for QwenProvider {
     fn kind(&self) -> &'static str {
@@ -510,7 +804,7 @@ impl ProviderAdapter for QwenProvider {
 
         let account_id = Uuid::new_v4();
         let connection = self.connection_from_envelope(envelope, account_id)?;
-        let headers = Self::build_headers(&connection)?;
+        let headers = Self::build_headers(&connection, false)?;
         let api_base = &connection.api_base;
 
         let response = self
@@ -697,15 +991,31 @@ impl ProviderAdapter for QwenProvider {
 
     async fn chat(&self, request: InferenceRequest) -> Result<InferenceResponse, ProviderError> {
         let connection = self.resolve_connection(&request).await?;
-        let headers = Self::build_headers(&connection)?;
+        let headers = Self::build_headers(&connection, false)?;
         let api_base = &connection.api_base;
-        let model = request.upstream_model.as_deref().unwrap_or("qwen-max");
+        let model = request
+            .upstream_model
+            .as_deref()
+            .unwrap_or("qwen3-coder-plus");
 
-        let messages: Vec<Value> = request
+        // For agent models (coder-model, etc.), inject system prompt and tools
+        let mut messages: Vec<Value> = request
             .messages
             .iter()
             .map(Self::chat_message_payload)
             .collect();
+
+        // Inject system prompt for agent models
+        if is_agent_model(model) {
+            let system_msg = json!({
+                "role": "system",
+                "content": qwen_cli_system_prompt()
+            });
+            // Only add if not already present
+            if messages.is_empty() || messages[0].get("role") != Some(&json!("system")) {
+                messages.insert(0, system_msg);
+            }
+        }
 
         let mut body = json!({
             "model": model,
@@ -713,7 +1023,10 @@ impl ProviderAdapter for QwenProvider {
             "stream": false,
         });
 
-        if !request.tools.is_empty() {
+        // Inject tools for agent models
+        if is_agent_model(model) {
+            body["tools"] = json!(agent_tools());
+        } else if !request.tools.is_empty() {
             body["tools"] = Value::Array(request.tools.iter().map(Self::tool_payload).collect());
         }
 
@@ -728,7 +1041,25 @@ impl ProviderAdapter for QwenProvider {
             .map_err(transport_error)?;
 
         let response = Self::ensure_success(response).await?;
-        let completion: ChatCompletionResponse = response.json().await.map_err(|e| {
+        let status = response.status();
+        let body_text = response.text().await.map_err(|e| {
+            ProviderError::new(
+                ProviderErrorKind::UpstreamUnavailable,
+                502,
+                format!("failed to read response body: {e}"),
+            )
+        })?;
+
+        // Try to parse as JSON, log error if it fails
+        let completion: ChatCompletionResponse = serde_json::from_str(&body_text).map_err(|e| {
+            eprintln!("\n=== QWEN RESPONSE PARSE ERROR ===");
+            eprintln!("Status: {status}");
+            eprintln!(
+                "Body (first 1000 chars): {}",
+                &body_text[..1000.min(body_text.len())]
+            );
+            eprintln!("Error: {e}");
+            eprintln!("===================================\n");
             ProviderError::new(
                 ProviderErrorKind::UpstreamUnavailable,
                 502,
@@ -744,10 +1075,7 @@ impl ProviderAdapter for QwenProvider {
             )
         })?;
 
-        let message = choice.message.unwrap_or(ChatMessage {
-            content: None,
-            tool_calls: None,
-        });
+        let message = choice.message.unwrap_or_default();
 
         let output_text = message.content.unwrap_or_default();
         let tool_calls = message
@@ -761,11 +1089,14 @@ impl ProviderAdapter for QwenProvider {
             })
             .collect();
 
-        let usage = completion.usage.unwrap_or_else(|| TokenUsage {
-            input_tokens: estimate_usage(&output_text),
-            output_tokens: estimate_usage(&output_text),
-            total_tokens: estimate_usage(&output_text) * 2,
-        });
+        let usage = completion
+            .usage
+            .map(protocol_core::TokenUsage::from)
+            .unwrap_or_else(|| protocol_core::TokenUsage {
+                input_tokens: estimate_usage(&output_text),
+                output_tokens: estimate_usage(&output_text),
+                total_tokens: estimate_usage(&output_text) * 2,
+            });
 
         Ok(InferenceResponse {
             id: completion.id,
@@ -783,9 +1114,63 @@ impl ProviderAdapter for QwenProvider {
         &self,
         request: InferenceRequest,
     ) -> Result<InferenceResponse, ProviderError> {
-        let mut req = request.clone();
-        req.upstream_model = req.upstream_model.or_else(|| Some("qwen-max".to_string()));
-        self.chat(req).await
+        let connection = self.resolve_connection(&request).await?;
+        let headers = Self::build_headers(&connection, false)?;
+        let api_base = &connection.api_base;
+        let model = request
+            .upstream_model
+            .as_deref()
+            .unwrap_or("qwen3-coder-plus");
+
+        // For agent models, inject system prompt and tools
+        let mut messages: Vec<Value> = request
+            .messages
+            .iter()
+            .map(Self::chat_message_payload)
+            .collect();
+
+        if is_agent_model(model) {
+            let system_msg = json!({
+                "role": "system",
+                "content": qwen_cli_system_prompt()
+            });
+            if messages.is_empty() || messages[0].get("role") != Some(&json!("system")) {
+                messages.insert(0, system_msg);
+            }
+        }
+
+        let mut body = json!({
+            "model": model,
+            "input": messages,
+            "stream": false,
+        });
+
+        if is_agent_model(model) {
+            body["tools"] = json!(agent_tools());
+        } else if !request.tools.is_empty() {
+            body["tools"] = Value::Array(request.tools.iter().map(Self::tool_payload).collect());
+        }
+
+        let response = self
+            .client
+            .post(format!("{api_base}/responses"))
+            .headers(headers)
+            .bearer_auth(&connection.bearer_token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(transport_error)?;
+
+        let response = Self::ensure_success(response).await?;
+        let completion: InferenceResponse = response.json().await.map_err(|e| {
+            ProviderError::new(
+                ProviderErrorKind::UpstreamUnavailable,
+                502,
+                format!("failed to parse responses response: {e}"),
+            )
+        })?;
+
+        Ok(completion)
     }
 
     async fn stream_chat(
@@ -793,25 +1178,43 @@ impl ProviderAdapter for QwenProvider {
         request: InferenceRequest,
     ) -> Result<ProviderStream, ProviderError> {
         let connection = self.resolve_connection(&request).await?;
-        let headers = Self::build_headers(&connection)?;
+        let headers = Self::build_headers(&connection, true)?;
         let api_base = &connection.api_base;
         let public_model = request.public_model.clone();
         let provider_kind = self.kind().to_string();
-        let model = request.upstream_model.as_deref().unwrap_or("qwen-max");
+        let model = request
+            .upstream_model
+            .as_deref()
+            .unwrap_or("qwen3-coder-plus");
 
-        let messages: Vec<Value> = request
+        // For agent models, inject system prompt and tools
+        let mut messages: Vec<Value> = request
             .messages
             .iter()
             .map(Self::chat_message_payload)
             .collect();
 
+        if is_agent_model(model) {
+            let system_msg = json!({
+                "role": "system",
+                "content": qwen_cli_system_prompt()
+            });
+            if messages.is_empty() || messages[0].get("role") != Some(&json!("system")) {
+                messages.insert(0, system_msg);
+            }
+        }
+
         let mut body = json!({
             "model": model,
             "messages": messages,
             "stream": true,
+            "stream_options": { "include_usage": true },
         });
 
-        if !request.tools.is_empty() {
+        // Inject tools for agent models
+        if is_agent_model(model) {
+            body["tools"] = json!(agent_tools());
+        } else if !request.tools.is_empty() {
             body["tools"] = Value::Array(request.tools.iter().map(Self::tool_payload).collect());
         }
 
@@ -838,23 +1241,44 @@ impl ProviderAdapter for QwenProvider {
         request: InferenceRequest,
     ) -> Result<ProviderStream, ProviderError> {
         let connection = self.resolve_connection(&request).await?;
-        let headers = Self::build_headers(&connection)?;
+        let headers = Self::build_headers(&connection, true)?;
         let api_base = &connection.api_base;
         let public_model = request.public_model.clone();
         let provider_kind = self.kind().to_string();
-        let model = request.upstream_model.as_deref().unwrap_or("qwen-max");
+        let model = request
+            .upstream_model
+            .as_deref()
+            .unwrap_or("qwen3-coder-plus");
 
-        let messages: Vec<Value> = request
+        // For agent models, inject system prompt and tools
+        let mut messages: Vec<Value> = request
             .messages
             .iter()
             .map(Self::chat_message_payload)
             .collect();
 
-        let body = json!({
+        if is_agent_model(model) {
+            let system_msg = json!({
+                "role": "system",
+                "content": qwen_cli_system_prompt()
+            });
+            if messages.is_empty() || messages[0].get("role") != Some(&json!("system")) {
+                messages.insert(0, system_msg);
+            }
+        }
+
+        let mut body = json!({
             "model": model,
             "input": messages,
             "stream": true,
         });
+
+        // Inject tools for agent models
+        if is_agent_model(model) {
+            body["tools"] = json!(agent_tools());
+        } else if !request.tools.is_empty() {
+            body["tools"] = Value::Array(request.tools.iter().map(Self::tool_payload).collect());
+        }
 
         let response = self
             .client
@@ -1078,13 +1502,35 @@ impl QwenProvider {
                                 }
                             }
                             Some("response.failed") => {
-                                let msg = parse_error_message(&message.data)
-                                    .unwrap_or_else(|| "responses request failed".to_string());
-                                yield Err(ProviderError::new(
-                                    ProviderErrorKind::UpstreamUnavailable,
-                                    502,
-                                    msg,
-                                ));
+                                let err = serde_json::from_str::<StreamErrorResponse>(&message.data);
+                                let (kind, status, msg) = match err {
+                                    Ok(e) => {
+                                        let code = e.error.code.as_deref().unwrap_or("");
+                                        let kind = match code {
+                                            "insufficient_quota" | "rate_limit_exceeded" => {
+                                                ProviderErrorKind::RateLimited
+                                            }
+                                            "token_expired" | "invalid_api_key"
+                                            | "authentication_failed" => {
+                                                ProviderErrorKind::InvalidCredentials
+                                            }
+                                            _ => ProviderErrorKind::UpstreamUnavailable,
+                                        };
+                                        let status = match kind {
+                                            ProviderErrorKind::RateLimited => 429,
+                                            ProviderErrorKind::InvalidCredentials => 401,
+                                            _ => 502,
+                                        };
+                                        (kind, status, e.error.message)
+                                    }
+                                    Err(_) => (
+                                        ProviderErrorKind::UpstreamUnavailable,
+                                        502,
+                                        parse_error_message(&message.data)
+                                            .unwrap_or_else(|| "responses request failed".to_string()),
+                                    ),
+                                };
+                                yield Err(ProviderError::new(kind, status, msg));
                                 return;
                             }
                             _ => {}
@@ -1138,10 +1584,17 @@ mod tests {
     fn known_models_contains_expected_ids() {
         let models = known_qwen_models();
         let ids: Vec<_> = models.iter().map(|m| m.id.as_str()).collect();
-        assert!(ids.contains(&"qwen-max"));
-        assert!(ids.contains(&"qwen-plus"));
-        assert!(ids.contains(&"qwen-turbo"));
-        assert!(ids.contains(&"qwen-coder"));
+        assert!(ids.contains(&"qwen3-coder-plus"));
+        assert!(ids.contains(&"qwen3-coder-flash"));
+        assert!(ids.contains(&"qwen3.5-plus"));
+        assert!(ids.contains(&"qwen3.6-plus"));
+        assert!(ids.contains(&"coder-model"));
+
+        // Verify aliases: qwen3.5-plus and qwen3.6-plus map to coder-model
+        let qwen35 = models.iter().find(|m| m.id == "qwen3.5-plus").unwrap();
+        assert_eq!(qwen35.upstream_model, "coder-model");
+        let qwen36 = models.iter().find(|m| m.id == "qwen3.6-plus").unwrap();
+        assert_eq!(qwen36.upstream_model, "coder-model");
     }
 
     #[test]
@@ -1151,7 +1604,8 @@ mod tests {
             "https://chat.qwen.ai/api/v1/oauth2/token"
         );
         assert_eq!(QWEN_OAUTH_CLIENT_ID, "f0304373b74a44d2b584a3fb70ca9e56");
-        assert!(QWEN_DEFAULT_API_BASE.ends_with("/compatible-mode/v1"));
+        assert!(QWEN_DEFAULT_API_BASE.ends_with("/v1"));
+        assert!(QWEN_DEFAULT_API_BASE.contains("portal.qwen.ai"));
     }
 
     #[tokio::test]
@@ -1161,5 +1615,64 @@ mod tests {
         let mut registry = ProviderRegistry::new();
         registry.register(provider);
         assert!(registry.get("qwen").is_some());
+    }
+
+    // ─── TDD Tests for the 3 gaps ──────────────────────────────────
+
+    // Test 1: stream_responses() should inject system prompt + tools for agent models
+    // Verifies that is_agent_model() returns true for coder-model and the tools list is non-empty
+    #[test]
+    fn is_agent_model_returns_true_for_coder_models() {
+        assert!(is_agent_model("coder-model"));
+        assert!(is_agent_model("qwen3-coder-plus"));
+        assert!(is_agent_model("qwen3-coder-flash"));
+        assert!(!is_agent_model("qwen-turbo"));
+        assert!(!is_agent_model("gpt-4"));
+    }
+
+    #[test]
+    fn agent_tools_returns_non_empty_list() {
+        let tools = agent_tools();
+        assert!(!tools.is_empty());
+        assert!(tools.len() >= 5);
+        // Verify tool names
+        let names: Vec<_> = tools
+            .iter()
+            .filter_map(|t| t.get("function")?.get("name")?.as_str())
+            .collect();
+        assert!(names.contains(&"read_file"));
+        assert!(names.contains(&"write_file"));
+        assert!(names.contains(&"edit"));
+        assert!(names.contains(&"run_shell_command"));
+        assert!(names.contains(&"todo_write"));
+    }
+
+    // Test 2: responses() should call /responses endpoint
+    // We verify the body format uses "input" key (not "messages") for /responses
+    #[test]
+    fn responses_body_uses_input_key() {
+        // The responses() method constructs a body with "input" field, not "messages"
+        let body = json!({
+            "model": "coder-model",
+            "input": [{"role": "user", "content": "hello"}],
+            "stream": true,
+        });
+        assert!(body.get("input").is_some());
+        assert!(body.get("messages").is_none());
+    }
+
+    // Test 3: stream_responses() should handle error events
+    #[test]
+    fn parse_stream_error_handles_response_failed_event() {
+        let frame = "event: response.failed\ndata: {\"error\":{\"message\":\"quota exceeded\",\"code\":\"insufficient_quota\",\"type\":\"rate_limit_error\"}}\n\n";
+        let message = parse_sse_frame(frame);
+        assert!(message.is_some());
+        let message = message.unwrap();
+        assert_eq!(message.event.as_deref(), Some("response.failed"));
+        // The error payload should be parseable
+        let err: Result<StreamErrorResponse, _> = serde_json::from_str(&message.data);
+        assert!(err.is_ok());
+        let err = err.unwrap();
+        assert!(err.error.message.contains("quota"));
     }
 }

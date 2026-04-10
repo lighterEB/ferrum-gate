@@ -981,6 +981,20 @@ pub(crate) fn provider_connection_from_parts(
         .and_then(Value::as_str)
         .or_else(|| metadata.get("api_base").and_then(Value::as_str))
         .map(ToString::to_string)
+        .or_else(|| {
+            // Support resource_url from OAuth credentials (e.g. "portal.qwen.ai")
+            credentials
+                .get("resource_url")
+                .and_then(Value::as_str)
+                .map(|url| {
+                    let base = url.trim_end_matches('/');
+                    if base.ends_with("/v1") {
+                        base.to_string()
+                    } else {
+                        format!("https://{base}/v1")
+                    }
+                })
+        })
         .or_else(|| default_api_base(provider_kind))
         .ok_or_else(|| {
             StoreError::Backend(format!("provider account {account_id} is missing api_base"))
