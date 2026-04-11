@@ -50,6 +50,7 @@ pub fn app(state: GatewayAppState) -> Router {
         .route("/health", get(health))
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(routes::chat::chat_completions))
+        .route("/v1/messages", post(routes::messages::messages))
         .route("/v1/responses", post(routes::responses::responses))
         .with_state(state);
 

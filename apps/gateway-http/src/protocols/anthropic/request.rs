@@ -142,7 +142,7 @@ fn parse_role(role: &str) -> MessageRole {
     }
 }
 
-fn message_to_canonical(msg: &AnthropicMessage) -> CanonicalMessage {
+pub(crate) fn message_to_canonical(msg: &AnthropicMessage) -> CanonicalMessage {
     let parts = anthropic_content_to_parts(&msg.content);
     let text = text_from_parts(&parts);
 
