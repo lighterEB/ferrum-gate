@@ -366,9 +366,10 @@ impl InMemoryPlatformStore {
         }
         // Check expiry
         if let Some(expiry) = record.view.expires_at
-            && Utc::now() >= expiry {
-                return Ok(None);
-            }
+            && Utc::now() >= expiry
+        {
+            return Ok(None);
+        }
         record.view.last_used_at = Some(Utc::now());
         let tenant = self
             .inner

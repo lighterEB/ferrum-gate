@@ -518,7 +518,7 @@ impl PostgresPlatformStore {
             "update tenant_api_keys
              set prefix = $1, status = 'active', secret_hash = $2, last_used_at = null
              where id = $3
-             returning id, tenant_id, label, prefix, status, created_at, last_used_at",
+             returning id, tenant_id, label, prefix, status, created_at, last_used_at, expires_at",
         )
         .bind(&secret[..12])
         .bind(hash_token(&secret))
@@ -544,7 +544,7 @@ impl PostgresPlatformStore {
             "update tenant_api_keys
              set status = 'revoked'
              where id = $1
-             returning id, tenant_id, label, prefix, status, created_at, last_used_at",
+             returning id, tenant_id, label, prefix, status, created_at, last_used_at, expires_at",
         )
         .bind(api_key_id)
         .fetch_one(&self.pool)
