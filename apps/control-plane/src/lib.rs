@@ -5,7 +5,7 @@ use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use provider_core::{ProviderAccountEnvelope, ProviderError, ProviderErrorKind, ProviderRegistry};
 use provider_openai_codex::OpenAiCodexProvider;
@@ -18,6 +18,8 @@ use storage::{AuthError, Permission, PlatformStore, ScopeTarget, ServiceAccountP
 use tower_http::cors::CorsLayer;
 use tracing::info;
 use uuid::Uuid;
+
+mod poller;
 
 #[derive(Clone)]
 pub struct ControlPlaneState {
@@ -95,6 +97,10 @@ pub fn app(state: ControlPlaneState) -> Router {
             post(drain_provider_account),
         )
         .route(
+            "/internal/v1/provider-accounts/{id}",
+            delete(delete_provider_account),
+        )
+        .route(
             "/internal/v1/route-groups",
             get(list_route_groups).post(create_route_group),
         )
@@ -128,7 +134,21 @@ pub fn app(state: ControlPlaneState) -> Router {
 pub async fn run(addr: SocketAddr, state: ControlPlaneState) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!("control-plane listening on {addr}");
-    axum::serve(listener, app(state)).await?;
+
+    // Spawn auto-poller background task
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let poller_config = poller::PollConfig::default_for_openai_codex();
+    let poller_state = state.clone();
+    let poller_handle = tokio::spawn(async move {
+        poller::run_poller(poller_state, poller_config, shutdown_rx).await;
+    });
+
+    let server = axum::serve(listener, app(state));
+    server.await?;
+
+    // Signal poller to shut down
+    let _ = shutdown_tx.send(());
+    let _ = poller_handle.await;
     Ok(())
 }
 
@@ -515,6 +535,43 @@ async fn drain_provider_account(
     Path(id): Path<Uuid>,
 ) -> Response {
     mutate_provider_state(state, headers, id, AccountState::Draining).await
+}
+
+async fn delete_provider_account(
+    State(state): State<ControlPlaneState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let principal = match authorize(
+        &state,
+        &headers,
+        Permission::ManageProviderState,
+        ScopeTarget::Global,
+    )
+    .await
+    {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+
+    match state.store.delete_provider_account(id).await {
+        Ok(true) => {
+            state
+                .store
+                .record_audit(
+                    &principal.subject,
+                    "provider_account.deleted",
+                    format!("provider_account:{id}"),
+                    Uuid::new_v4().to_string(),
+                    json!({ "status": "deleted" }),
+                )
+                .await
+                .ok();
+            Json(json!({ "status": "deleted", "account_id": id })).into_response()
+        }
+        Ok(false) => control_error(StatusCode::NOT_FOUND, "Provider account not found"),
+        Err(error) => control_error(StatusCode::BAD_REQUEST, &error.to_string()),
+    }
 }
 
 async fn probe_provider_account_quota(
@@ -1119,6 +1176,44 @@ async fn probe_provider_account_failure(
 }
 
 fn provider_outcome_for_error(error: &ProviderError) -> ProviderOutcome {
+    // Known suspension patterns — these are credential issues, not bans
+    if error
+        .code
+        .as_deref()
+        .is_some_and(|c| c.contains("suspended"))
+        || error.message.contains("suspended")
+    {
+        return ProviderOutcome::InvalidCredentials;
+    }
+
+    // Ban detection: 403 = account forbidden/blocked
+    if error.status_code == 403 {
+        return ProviderOutcome::AccountBanned {
+            reason: "forbidden".to_string(),
+        };
+    }
+    // Account deactivated keyword in message or error code
+    if error.message.contains("deactivated")
+        || error
+            .code
+            .as_deref()
+            .is_some_and(|c| c.contains("deactivated"))
+    {
+        return ProviderOutcome::AccountBanned {
+            reason: "deactivated".to_string(),
+        };
+    }
+    // Cloudflare challenge / bot block
+    if error
+        .code
+        .as_deref()
+        .is_some_and(|c| c.contains("challenge") || c.contains("cf_"))
+    {
+        return ProviderOutcome::AccountBanned {
+            reason: "cf_blocked".to_string(),
+        };
+    }
+
     match error.kind {
         ProviderErrorKind::RateLimited => ProviderOutcome::RateLimited {
             retry_after_seconds: Some(30),
@@ -1324,7 +1419,7 @@ fn default_alert_delivery_limit() -> usize {
     50
 }
 
-async fn execute_provider_account_probe(
+pub(crate) async fn execute_provider_account_probe(
     state: &ControlPlaneState,
     principal_subject: &str,
     id: Uuid,
@@ -1547,7 +1642,7 @@ async fn execute_provider_account_quota_probe(
     }
 }
 
-async fn execute_provider_account_refresh(
+pub(crate) async fn execute_provider_account_refresh(
     state: &ControlPlaneState,
     principal_subject: &str,
     id: Uuid,

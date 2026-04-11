@@ -91,6 +91,13 @@ impl AccountRuntime {
                 self.consecutive_failures = self.consecutive_failures.saturating_add(1);
                 self.health_score = self.health_score.saturating_sub(25);
             }
+            ProviderOutcome::AccountBanned { .. } => {
+                self.state = AccountState::Disabled;
+                self.consecutive_failures = u32::MAX;
+                self.health_score = 0;
+                self.cooldown_until = None;
+                self.circuit_open_until = None;
+            }
         }
     }
 }
@@ -114,11 +121,18 @@ pub struct SelectedCandidate {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ProviderOutcome {
     Success,
-    RateLimited { retry_after_seconds: Option<i64> },
+    RateLimited {
+        retry_after_seconds: Option<i64>,
+    },
     UpstreamFailure,
     TransportFailure,
     InvalidCredentials,
     QuotaExhausted,
+    /// Account banned by upstream (403 / deactivated / cf-blocked).
+    /// Maps to `Disabled` state — will not re-enter scheduler automatically.
+    AccountBanned {
+        reason: String,
+    },
 }
 
 #[must_use]
@@ -363,5 +377,63 @@ mod tests {
         assert!(runtime.cooldown_until.is_none());
         assert_eq!(runtime.consecutive_failures, 0);
         assert!(runtime.is_schedulable(now));
+    }
+
+    // ─── TDD Tests: AccountBanned (ban detection) ─────────────────
+
+    #[test]
+    fn account_banned_moves_to_disabled_and_zeroes_health() {
+        let now = Utc::now();
+        let mut runtime = AccountRuntime::new(AccountState::Active, 8);
+        runtime.apply_outcome(
+            ProviderOutcome::AccountBanned {
+                reason: "forbidden".to_string(),
+            },
+            now,
+        );
+
+        assert_eq!(runtime.state, AccountState::Disabled);
+        assert_eq!(runtime.health_score, 0);
+        assert_eq!(runtime.consecutive_failures, u32::MAX);
+        assert!(!runtime.is_schedulable(now));
+    }
+
+    #[test]
+    fn account_banned_clears_cooldown_and_circuit() {
+        let now = Utc::now();
+        let mut runtime = AccountRuntime {
+            state: AccountState::Cooling,
+            health_score: 50,
+            cooldown_until: Some(now + TimeDelta::minutes(30)),
+            circuit_open_until: Some(now + TimeDelta::seconds(10)),
+            consecutive_failures: 2,
+            in_flight: 0,
+            max_in_flight: 8,
+            last_used_at: None,
+        };
+
+        runtime.apply_outcome(
+            ProviderOutcome::AccountBanned {
+                reason: "deactivated".to_string(),
+            },
+            now,
+        );
+
+        assert_eq!(runtime.state, AccountState::Disabled);
+        assert!(runtime.cooldown_until.is_none());
+        assert!(runtime.circuit_open_until.is_none());
+    }
+
+    #[test]
+    fn account_banned_reason_is_preserved() {
+        let outcome = ProviderOutcome::AccountBanned {
+            reason: "cf_blocked".to_string(),
+        };
+        match &outcome {
+            ProviderOutcome::AccountBanned { reason } => {
+                assert_eq!(reason, "cf_blocked");
+            }
+            _ => panic!("expected AccountBanned"),
+        }
     }
 }

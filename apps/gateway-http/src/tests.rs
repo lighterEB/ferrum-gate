@@ -1278,7 +1278,7 @@ async fn newly_created_tenant_key_can_access_gateway() {
         .id;
     let created = state
         .store
-        .create_tenant_api_key(tenant_id, "integration".to_string())
+        .create_tenant_api_key(tenant_id, "integration".to_string(), None)
         .await
         .expect("key");
     let app = app(state);
@@ -3020,4 +3020,87 @@ async fn chat_completions_streaming_endpoint_emits_openai_style_error_chunk() {
         Some("Your authentication token has been invalidated. Please try signing in again.")
     );
     assert_eq!(payloads.last().map(String::as_str), Some("[DONE]"));
+}
+
+// ─── TDD Tests: Ban detection in provider_outcome_for_error ──────────
+
+#[test]
+fn ban_detection_403_returns_account_banned() {
+    let error = ProviderError {
+        kind: ProviderErrorKind::UpstreamUnavailable,
+        message: "forbidden".to_string(),
+        status_code: 403,
+        code: None,
+    };
+    let outcome = provider_outcome_for_error(&error);
+    assert!(
+        matches!(
+            outcome,
+            ProviderOutcome::AccountBanned { ref reason } if reason == "forbidden"
+        ),
+        "403 should map to AccountBanned"
+    );
+}
+
+#[test]
+fn ban_detection_deactivated_message_returns_account_banned() {
+    let error = ProviderError {
+        kind: ProviderErrorKind::UpstreamUnavailable,
+        message: "account_deactivated by admin".to_string(),
+        status_code: 400,
+        code: None,
+    };
+    let outcome = provider_outcome_for_error(&error);
+    assert!(
+        matches!(
+            outcome,
+            ProviderOutcome::AccountBanned { ref reason } if reason == "deactivated"
+        ),
+        "deactivated message should map to AccountBanned"
+    );
+}
+
+#[test]
+fn ban_detection_cf_challenge_code_returns_account_banned() {
+    let error = ProviderError {
+        kind: ProviderErrorKind::UpstreamUnavailable,
+        message: "challenge page".to_string(),
+        status_code: 403,
+        code: Some("cf_challenge".to_string()),
+    };
+    let outcome = provider_outcome_for_error(&error);
+    assert!(
+        matches!(
+            outcome,
+            ProviderOutcome::AccountBanned { ref reason } if reason == "forbidden"
+        ),
+        "403 takes precedence and maps to forbidden"
+    );
+}
+
+#[test]
+fn non_ban_error_maps_to_correct_outcome() {
+    let error = ProviderError {
+        kind: ProviderErrorKind::RateLimited,
+        message: "too many requests".to_string(),
+        status_code: 429,
+        code: None,
+    };
+    let outcome = provider_outcome_for_error(&error);
+    assert!(
+        matches!(outcome, ProviderOutcome::RateLimited { .. }),
+        "rate limited should map to RateLimited"
+    );
+
+    let error = ProviderError {
+        kind: ProviderErrorKind::InvalidCredentials,
+        message: "invalid api key".to_string(),
+        status_code: 401,
+        code: None,
+    };
+    let outcome = provider_outcome_for_error(&error);
+    assert!(
+        matches!(outcome, ProviderOutcome::InvalidCredentials),
+        "401 should map to InvalidCredentials"
+    );
 }

@@ -44,6 +44,9 @@ pub struct TenantApiKeyView {
     pub status: TenantApiKeyStatus,
     pub created_at: DateTime<Utc>,
     pub last_used_at: Option<DateTime<Utc>>,
+    /// Optional expiry time. If set and past, the key is treated as revoked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -366,10 +369,19 @@ impl PlatformStore {
         &self,
         tenant_id: Uuid,
         label: String,
+        expires_at: Option<DateTime<Utc>>,
     ) -> Result<CreatedApiKey, AuthError> {
         match self {
-            Self::InMemory(store) => store.create_tenant_api_key(tenant_id, label).await,
-            Self::Postgres(store) => store.create_tenant_api_key(tenant_id, label).await,
+            Self::InMemory(store) => {
+                store
+                    .create_tenant_api_key(tenant_id, label, expires_at)
+                    .await
+            }
+            Self::Postgres(store) => {
+                store
+                    .create_tenant_api_key(tenant_id, label, expires_at)
+                    .await
+            }
         }
     }
 
@@ -693,6 +705,15 @@ impl PlatformStore {
         match self {
             Self::InMemory(store) => store.set_provider_account_state(account_id, state).await,
             Self::Postgres(store) => store.set_provider_account_state(account_id, state).await,
+        }
+    }
+
+    /// Physically deletes a provider account and all associated data.
+    /// Only accounts in `Disabled` or `InvalidCredentials` state can be deleted.
+    pub async fn delete_provider_account(&self, account_id: Uuid) -> Result<bool, StoreError> {
+        match self {
+            Self::InMemory(store) => store.delete_provider_account(account_id).await,
+            Self::Postgres(store) => store.delete_provider_account(account_id).await,
         }
     }
 

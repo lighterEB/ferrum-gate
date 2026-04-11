@@ -10,3 +10,5 @@ coverage
 .ai/
 .omx/
 .qwen/
+docs/architecture.md
+docs/dev-progress.md

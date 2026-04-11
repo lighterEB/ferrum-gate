@@ -1,6 +1,7 @@
 mod core;
 mod middleware;
 mod openai_http;
+mod protocols;
 mod routes;
 
 use anyhow::Result;
@@ -109,6 +110,44 @@ fn model_capability_label(capability: &ModelCapability) -> &'static str {
 }
 
 pub(crate) fn provider_outcome_for_error(error: &ProviderError) -> ProviderOutcome {
+    // Known suspension patterns — these are credential issues, not bans
+    if error
+        .code
+        .as_deref()
+        .is_some_and(|c| c.contains("suspended"))
+        || error.message.contains("suspended")
+    {
+        return ProviderOutcome::InvalidCredentials;
+    }
+
+    // Ban detection: 403 = account forbidden/blocked
+    if error.status_code == 403 {
+        return ProviderOutcome::AccountBanned {
+            reason: "forbidden".to_string(),
+        };
+    }
+    // Account deactivated keyword in message or error code
+    if error.message.contains("deactivated")
+        || error
+            .code
+            .as_deref()
+            .is_some_and(|c| c.contains("deactivated"))
+    {
+        return ProviderOutcome::AccountBanned {
+            reason: "deactivated".to_string(),
+        };
+    }
+    // Cloudflare challenge / bot block
+    if error
+        .code
+        .as_deref()
+        .is_some_and(|c| c.contains("challenge") || c.contains("cf_"))
+    {
+        return ProviderOutcome::AccountBanned {
+            reason: "cf_blocked".to_string(),
+        };
+    }
+
     match error.kind {
         ProviderErrorKind::RateLimited => ProviderOutcome::RateLimited {
             retry_after_seconds: Some(30),

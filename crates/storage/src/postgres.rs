@@ -11,7 +11,7 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
     aead::{Aead, KeyInit},
 };
-use chrono::{TimeDelta, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use protocol_core::{ModelDescriptor, TokenUsage};
 use provider_core::{
     AccountCapabilities, ProviderAccountEnvelope, ProviderConnectionInfo, QuotaSnapshot,
@@ -53,7 +53,11 @@ static MIGRATIONS: &[Migration] = &[
         sql: include_str!("../../../migrations/0001_initial.sql"),
     },
     // Add new migrations here:
-    // Migration { version: 2, label: "your_change", sql: include_str!("../../../migrations/0002_your_change.sql") },
+    Migration {
+        version: 2,
+        label: "api_key_expires_at",
+        sql: include_str!("../../../migrations/0002_api_key_expires_at.sql"),
+    },
 ];
 
 #[derive(Clone)]
@@ -313,10 +317,12 @@ impl PostgresPlatformStore {
         secret: &str,
     ) -> Result<Option<GatewayAuthContext>, StoreError> {
         let row = sqlx::query(
-            "select k.id as api_key_id, t.id, t.slug, t.name, t.suspended, t.created_at
+            "select k.id as api_key_id, t.id, t.slug, t.name, t.suspended, t.created_at,
+                    k.expires_at
              from tenant_api_keys k
              join tenants t on t.id = k.tenant_id
              where k.secret_hash = $1 and k.status = 'active'
+               and (k.expires_at is null or k.expires_at > now())
              limit 1",
         )
         .bind(hash_token(secret))
@@ -456,6 +462,7 @@ impl PostgresPlatformStore {
         &self,
         tenant_id: Uuid,
         label: String,
+        expires_at: Option<DateTime<Utc>>,
     ) -> Result<CreatedApiKey, AuthError> {
         let tenant_exists =
             sqlx::query_scalar::<_, i64>("select count(*) from tenants where id = $1")
@@ -476,12 +483,13 @@ impl PostgresPlatformStore {
             status: TenantApiKeyStatus::Active,
             created_at: Utc::now(),
             last_used_at: None,
+            expires_at,
         };
 
         sqlx::query(
             "insert into tenant_api_keys
-             (id, tenant_id, prefix, label, status, secret_hash, created_at, last_used_at)
-             values ($1, $2, $3, $4, 'active', $5, $6, $7)",
+             (id, tenant_id, prefix, label, status, secret_hash, created_at, last_used_at, expires_at)
+             values ($1, $2, $3, $4, 'active', $5, $6, $7, $8)",
         )
         .bind(record.id)
         .bind(record.tenant_id)
@@ -490,6 +498,7 @@ impl PostgresPlatformStore {
         .bind(hash_token(&secret))
         .bind(record.created_at)
         .bind(record.last_used_at)
+        .bind(record.expires_at)
         .execute(&self.pool)
         .await
         .map_err(auth_backend_error)?;
@@ -1168,6 +1177,75 @@ impl PostgresPlatformStore {
         row.map(|row| provider_account_from_row(&row)).transpose()
     }
 
+    /// Physically deletes a provider account and all associated data.
+    /// Only accounts in `Disabled` or `InvalidCredentials` state can be deleted.
+    pub async fn delete_provider_account(&self, account_id: Uuid) -> Result<bool, StoreError> {
+        // Check state
+        let row = sqlx::query("select state from provider_accounts where id = $1")
+            .bind(account_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(store_backend_error)?;
+
+        let Some(row) = row else {
+            return Ok(false);
+        };
+        let state: String = row.get("state");
+        match state.as_str() {
+            "disabled" | "invalid_credentials" => {}
+            other => {
+                return Err(StoreError::Backend(format!(
+                    "account must be in Disabled or InvalidCredentials state to delete, currently: {other}"
+                )));
+            }
+        }
+
+        // Delete in order (foreign key constraints)
+        sqlx::query("delete from route_group_bindings where provider_account_id = $1")
+            .bind(account_id)
+            .execute(&self.pool)
+            .await
+            .map_err(store_backend_error)?;
+
+        sqlx::query("delete from quota_snapshots where provider_account_id = $1")
+            .bind(account_id)
+            .execute(&self.pool)
+            .await
+            .map_err(store_backend_error)?;
+
+        sqlx::query("delete from probe_dispatch_leases where provider_account_id = $1")
+            .bind(account_id)
+            .execute(&self.pool)
+            .await
+            .map_err(store_backend_error)?;
+
+        sqlx::query("delete from refresh_dispatch_leases where provider_account_id = $1")
+            .bind(account_id)
+            .execute(&self.pool)
+            .await
+            .map_err(store_backend_error)?;
+
+        sqlx::query("delete from account_runtime where provider_account_id = $1")
+            .bind(account_id)
+            .execute(&self.pool)
+            .await
+            .map_err(store_backend_error)?;
+
+        sqlx::query("delete from provider_credentials where provider_account_id = $1")
+            .bind(account_id)
+            .execute(&self.pool)
+            .await
+            .map_err(store_backend_error)?;
+
+        let result = sqlx::query("delete from provider_accounts where id = $1")
+            .bind(account_id)
+            .execute(&self.pool)
+            .await
+            .map_err(store_backend_error)?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
     pub async fn create_route_group(
         &self,
         public_model: String,
@@ -1760,6 +1838,7 @@ fn tenant_api_key_view_from_row(row: &PgRow) -> Result<TenantApiKeyView, StoreEr
         )?,
         created_at: row.try_get("created_at").map_err(store_backend_error)?,
         last_used_at: row.try_get("last_used_at").map_err(store_backend_error)?,
+        expires_at: row.try_get("expires_at").map_err(store_backend_error)?,
     })
 }
 

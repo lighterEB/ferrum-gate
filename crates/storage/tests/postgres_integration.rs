@@ -60,7 +60,7 @@ async fn postgres_store_round_trips_keys_and_provider_credentials() {
         .await
         .expect("tenant");
     let created = store
-        .create_tenant_api_key(tenant.id, "primary".to_string())
+        .create_tenant_api_key(tenant.id, "primary".to_string(), None)
         .await
         .expect("created key");
     assert!(

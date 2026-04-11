@@ -6,6 +6,7 @@ use axum::{
     response::{IntoResponse, Json, Response},
     routing::{get, post},
 };
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::net::SocketAddr;
@@ -110,7 +111,7 @@ async fn create_api_key(
 
     match state
         .store
-        .create_tenant_api_key(principal.tenant_id, payload.label)
+        .create_tenant_api_key(principal.tenant_id, payload.label, payload.expires_at)
         .await
     {
         Ok(created) => Json(json!(created)).into_response(),
@@ -245,6 +246,7 @@ impl ResponseExt for Response {
 #[derive(Debug, Deserialize)]
 struct CreateApiKeyRequest {
     label: String,
+    expires_at: Option<DateTime<Utc>>,
 }
 
 #[cfg(test)]

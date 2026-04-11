@@ -7,7 +7,7 @@ use crate::{
     TenantManagementPrincipal, UsageSummary, default_model_capabilities, derive_route_group_slug,
     provider_connection_from_parts, role_allows, scope_allows,
 };
-use chrono::{TimeDelta, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use protocol_core::{ModelDescriptor, TokenUsage};
 use provider_core::{
     AccountCapabilities, ProviderAccountEnvelope, ProviderConnectionInfo, QuotaSnapshot,
@@ -172,6 +172,7 @@ impl InMemoryPlatformStore {
                 status: TenantApiKeyStatus::Active,
                 created_at: now,
                 last_used_at: None,
+                expires_at: None,
             },
             secret: api_key_secret.clone(),
         };
@@ -363,6 +364,11 @@ impl InMemoryPlatformStore {
         if record.view.status != TenantApiKeyStatus::Active {
             return Ok(None);
         }
+        // Check expiry
+        if let Some(expiry) = record.view.expires_at
+            && Utc::now() >= expiry {
+                return Ok(None);
+            }
         record.view.last_used_at = Some(Utc::now());
         let tenant = self
             .inner
@@ -454,6 +460,7 @@ impl InMemoryPlatformStore {
         &self,
         tenant_id: Uuid,
         label: String,
+        expires_at: Option<DateTime<Utc>>,
     ) -> Result<CreatedApiKey, AuthError> {
         if !self.inner.tenants.read().await.contains_key(&tenant_id) {
             return Err(AuthError::Unauthorized);
@@ -468,6 +475,7 @@ impl InMemoryPlatformStore {
             status: TenantApiKeyStatus::Active,
             created_at: Utc::now(),
             last_used_at: None,
+            expires_at,
         };
 
         let record = TenantApiKeyRecord {
@@ -1011,6 +1019,55 @@ impl InMemoryPlatformStore {
         Ok(Some(record.clone()))
     }
 
+    /// Physically deletes a provider account and all associated data.
+    /// Only accounts in `Disabled` or `InvalidCredentials` state can be deleted.
+    /// Returns `Ok(true)` if the account was deleted, `Ok(false)` if it didn't exist.
+    pub async fn delete_provider_account(&self, account_id: Uuid) -> Result<bool, StoreError> {
+        // Check state first
+        {
+            let accounts = self.inner.provider_accounts.read().await;
+            let Some(record) = accounts.get(&account_id) else {
+                return Ok(false);
+            };
+            match &record.state {
+                AccountState::Disabled | AccountState::InvalidCredentials => {}
+                other => {
+                    return Err(StoreError::Backend(format!(
+                        "account must be in Disabled or InvalidCredentials state to delete, currently: {other:?}"
+                    )));
+                }
+            }
+        }
+
+        // Remove from all stores
+        self.inner
+            .provider_accounts
+            .write()
+            .await
+            .remove(&account_id);
+        self.inner
+            .provider_credentials
+            .write()
+            .await
+            .remove(&account_id);
+        self.inner.runtimes.write().await.remove(&account_id);
+
+        // Remove route group bindings
+        {
+            let mut bindings = self.inner.route_group_bindings.write().await;
+            bindings.retain(|_, b| b.provider_account_id != account_id);
+        }
+
+        // Remove quota snapshots
+        self.inner.quota_snapshots.write().await.remove(&account_id);
+
+        // Remove probe/refresh leases
+        self.inner.probe_leases.write().await.remove(&account_id);
+        self.inner.refresh_leases.write().await.remove(&account_id);
+
+        Ok(true)
+    }
+
     pub async fn create_route_group(
         &self,
         public_model: String,
@@ -1461,7 +1518,7 @@ mod tests {
             .id;
 
         let created = store
-            .create_tenant_api_key(tenant_id, "integration".to_string())
+            .create_tenant_api_key(tenant_id, "integration".to_string(), None)
             .await
             .expect("key should be created");
         assert!(
@@ -1825,5 +1882,170 @@ mod tests {
         assert_eq!(connection.api_base, "https://api.openai.com/v1");
         assert_eq!(connection.provider_kind, "openai_codex");
         assert_eq!(connection.bearer_token, "demo-access-token");
+    }
+
+    // ─── TDD Tests: delete_provider_account ───────────────────────────────
+
+    // Test 2.1: delete_disabled_account
+    #[tokio::test]
+    async fn delete_disabled_account() {
+        let store = InMemoryPlatformStore::demo();
+        let account = store
+            .list_provider_accounts()
+            .await
+            .expect("accounts")
+            .into_iter()
+            .next()
+            .expect("demo account");
+
+        // First disable the account
+        store
+            .set_provider_account_state(account.id, AccountState::Disabled)
+            .await
+            .expect("disable");
+
+        // Now delete it
+        let result = store.delete_provider_account(account.id).await;
+        assert!(result.is_ok(), "delete disabled account should succeed");
+        assert!(
+            result.unwrap(),
+            "delete should return true when account existed"
+        );
+
+        // Verify it's gone
+        let remaining = store.list_provider_accounts().await.expect("accounts");
+        assert!(
+            remaining.iter().all(|a| a.id != account.id),
+            "account should be removed"
+        );
+    }
+
+    // Test 2.2: delete_invalid_credentials_account
+    #[tokio::test]
+    async fn delete_invalid_credentials_account() {
+        let store = InMemoryPlatformStore::demo();
+        let account = store
+            .list_provider_accounts()
+            .await
+            .expect("accounts")
+            .into_iter()
+            .next()
+            .expect("demo account");
+
+        store
+            .set_provider_account_state(account.id, AccountState::InvalidCredentials)
+            .await
+            .expect("set state");
+
+        let result = store.delete_provider_account(account.id).await;
+        assert!(result.is_ok() && result.unwrap());
+    }
+
+    // Test 2.3: delete_active_account_fails
+    #[tokio::test]
+    async fn delete_active_account_fails() {
+        let store = InMemoryPlatformStore::demo();
+        let account = store
+            .list_provider_accounts()
+            .await
+            .expect("accounts")
+            .into_iter()
+            .next()
+            .expect("demo account");
+
+        let result = store.delete_provider_account(account.id).await;
+        assert!(result.is_err(), "deleting active account should fail");
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("must be in Disabled")
+                || err.to_string().contains("InvalidCredentials"),
+            "error should mention state requirement: {}",
+            err
+        );
+    }
+
+    // Test 2.4: delete_draining_account_fails
+    #[tokio::test]
+    async fn delete_draining_account_fails() {
+        let store = InMemoryPlatformStore::demo();
+        let account = store
+            .list_provider_accounts()
+            .await
+            .expect("accounts")
+            .into_iter()
+            .next()
+            .expect("demo account");
+
+        store
+            .set_provider_account_state(account.id, AccountState::Draining)
+            .await
+            .expect("set draining");
+
+        let result = store.delete_provider_account(account.id).await;
+        assert!(result.is_err(), "deleting draining account should fail");
+    }
+
+    // Test 2.7: delete_nonexistent_account
+    #[tokio::test]
+    async fn delete_nonexistent_account() {
+        let store = InMemoryPlatformStore::demo();
+        let fake_id = Uuid::new_v4();
+        let result = store.delete_provider_account(fake_id).await;
+        assert!(
+            result.is_ok() && !result.unwrap(),
+            "delete nonexistent account should return Ok(false)"
+        );
+    }
+
+    // Test 2.6: delete_removes_bindings
+    #[tokio::test]
+    async fn delete_removes_runtime() {
+        let store = InMemoryPlatformStore::demo();
+        let account = store
+            .list_provider_accounts()
+            .await
+            .expect("accounts")
+            .into_iter()
+            .next()
+            .expect("demo account");
+
+        let account_id = account.id;
+
+        // Verify runtime exists
+        {
+            let runtimes = store.inner.runtimes.read().await;
+            assert!(
+                runtimes.contains_key(&account_id),
+                "runtime should exist before delete"
+            );
+        }
+
+        // Disable and delete
+        store
+            .set_provider_account_state(account_id, AccountState::Disabled)
+            .await
+            .expect("disable");
+        store
+            .delete_provider_account(account_id)
+            .await
+            .expect("delete");
+
+        // Verify runtime is gone
+        {
+            let runtimes = store.inner.runtimes.read().await;
+            assert!(
+                !runtimes.contains_key(&account_id),
+                "runtime should be removed after delete"
+            );
+        }
+
+        // Verify credentials are gone
+        {
+            let creds = store.inner.provider_credentials.read().await;
+            assert!(
+                !creds.contains_key(&account_id),
+                "credentials should be removed after delete"
+            );
+        }
     }
 }
